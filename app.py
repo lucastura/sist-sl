@@ -1,14 +1,14 @@
 # ==============================
-# app.py (v2 – alunos e catálogo automáticos)
+# app.py (v2.3 – ordenação segura + XlsxWriter por padrão)
 # ==============================
 # Sala de Leitura – Empréstimos de Livros e Jogos
 # UI: Streamlit | Banco: SQLite (sala_leitura.db)
-# Mudanças:
-# - Removeu campo "ID do item" (usa apenas nome do item)
-# - Aluno separado em: Nome, Sobrenome, Série
-# - Cadastro automático de alunos ao emprestar (com autocomplete)
-# - Catálogo automático de itens ao emprestar (mantém aba Itens para cadastro manual)
-# - Exportação Excel com layout mais simples e legível
+#
+# Requisitos:
+#   pip install -r requirements.txt
+#
+# Rodar:
+#   streamlit run app.py
 
 from __future__ import annotations
 import streamlit as st
@@ -45,10 +45,15 @@ def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
+def _table_has_column(con, table, column):
+    cur = con.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]  # name is index 1
+    return column in cols
+
+
 def init_db():
     with get_conn() as con:
         cur = con.cursor()
-        # movimentacoes
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS movimentacoes (
@@ -68,7 +73,6 @@ def init_db():
             );
             """
         )
-        # itens (sem item_id)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS itens (
@@ -78,7 +82,6 @@ def init_db():
             );
             """
         )
-        # alunos
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS alunos (
@@ -92,6 +95,26 @@ def init_db():
         )
         con.commit()
 
+        # Migração leve: garante colunas
+        for col, default in [
+            ("item_nome", "''"),
+            ("categoria", "''"),
+            ("aluno_nome", "''"),
+            ("aluno_sobrenome", "''"),
+            ("aluno_serie", "''"),
+            ("responsavel", "''"),
+            ("prev_devolucao", "''"),
+            ("observacoes", "''"),
+        ]:
+            if not _table_has_column(con, "movimentacoes", col):
+                con.execute(f"ALTER TABLE movimentacoes ADD COLUMN {col} TEXT DEFAULT {default}")
+        for col in ["item_nome", "categoria"]:
+            if not _table_has_column(con, "itens", col):
+                con.execute(f"ALTER TABLE itens ADD COLUMN {col} TEXT")
+        for col in ["nome", "sobrenome", "serie"]:
+            if not _table_has_column(con, "alunos", col):
+                con.execute(f"ALTER TABLE alunos ADD COLUMN {col} TEXT")
+        con.commit()
 
 @st.cache_data(ttl=5)
 def df_mov() -> pd.DataFrame:
@@ -108,7 +131,6 @@ def df_mov() -> pd.DataFrame:
             df[c] = ""
     return df[COLS_MOV].copy()
 
-
 @st.cache_data(ttl=5)
 def df_itens() -> pd.DataFrame:
     init_db()
@@ -118,7 +140,6 @@ def df_itens() -> pd.DataFrame:
         return pd.DataFrame(columns=COLS_ITENS)
     return df[COLS_ITENS].fillna("")
 
-
 @st.cache_data(ttl=5)
 def df_alunos() -> pd.DataFrame:
     init_db()
@@ -127,7 +148,6 @@ def df_alunos() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=COLS_ALUNOS)
     return df[COLS_ALUNOS].fillna("")
-
 
 def inserir_movimento(reg: dict):
     init_db()
@@ -143,7 +163,6 @@ def inserir_movimento(reg: dict):
         con.commit()
     df_mov.clear()
 
-
 def upsert_item(item_nome: str, categoria: str):
     if not item_nome.strip():
         return
@@ -151,12 +170,10 @@ def upsert_item(item_nome: str, categoria: str):
     with get_conn() as con:
         con.execute(
             "INSERT OR IGNORE INTO itens (item_nome,categoria) VALUES (?,?)",
-            (item_nome.strip(), categoria.strip() or "Livro"),
+            (item_nome.strip(), (categoria or "Livro").strip()),
         )
-        # Se já existia, opcionalmente atualizar categoria se vier vazia → manter
         con.commit()
     df_itens.clear()
-
 
 def upsert_aluno(nome: str, sobrenome: str, serie: str):
     if not (nome.strip() or sobrenome.strip()):
@@ -170,23 +187,20 @@ def upsert_aluno(nome: str, sobrenome: str, serie: str):
         con.commit()
     df_alunos.clear()
 
-
 # ---------------- Regras de disponibilidade ----------------
 
 def status_itens(dfm: pd.DataFrame) -> pd.DataFrame:
     if dfm.empty:
         return pd.DataFrame(columns=["item_nome", "categoria", "status", "aluno", "turma", "prev_devolucao"])    
     df = dfm.copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    # último registro por item
-    idx = df.sort_values('timestamp').groupby('item_nome').tail(1).index
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    idx = df.sort_values("timestamp").groupby("item_nome").tail(1).index
     ult = df.loc[idx].copy()
-    ult['status'] = ult['tipo'].apply(lambda t: 'Emprestado' if str(t).lower().startswith('emprest') else 'Disponível')
-    ult['aluno'] = (ult['aluno_nome'].fillna("") + ' ' + ult['aluno_sobrenome'].fillna("")).str.strip()
-    ult['turma'] = ult['aluno_serie'].fillna("")
+    ult["status"] = ult["tipo"].apply(lambda t: "Emprestado" if str(t).lower().startswith("emprest") else "Disponível")
+    ult["aluno"] = (ult["aluno_nome"].fillna("") + " " + ult["aluno_sobrenome"].fillna("")).str.strip()
+    ult["turma"] = ult["aluno_serie"].fillna("")
     out = ult[["item_nome", "categoria", "status", "aluno", "turma", "prev_devolucao"]].reset_index(drop=True)
     return out
-
 
 # ---------------- UI ----------------
 
@@ -210,7 +224,7 @@ dfi = df_itens()
 dfa = df_alunos()
 dfs = status_itens(dfm)
 
-# Helpers de autocomplete de aluno
+# Autocomplete de aluno
 alunos_options = []
 if not dfa.empty:
     alunos_options = [f"{r.nome} {r.sobrenome} — {r.serie}".strip() for r in dfa.itertuples(index=False)]
@@ -233,12 +247,10 @@ def registrar_mov(tipo: str, item_nome: str, categoria: str, nome: str, sobrenom
         "prev_devolucao": prev_dev.strftime('%d/%m/%Y') if prev_dev else "",
         "observacoes": observ,
     }
-    # cadastro automático de aluno e item
     upsert_aluno(nome, sobrenome, serie)
     upsert_item(item_nome, categoria)
     inserir_movimento(reg)
     st.success(f"{tipo} registrado: {item_nome} → {nome} {sobrenome} ({serie}).")
-
 
 # ------ Aba Empréstimo ------
 with abas[0]:
@@ -248,10 +260,8 @@ with abas[0]:
     with col1:
         usar_catalogo = st.toggle("Selecionar item a partir do catálogo (aba Itens)", value=not df_itens().empty)
         if usar_catalogo and not df_itens().empty:
-            # NOVO: não filtra emprestados. Mostra status ao lado do nome.
             itens_all = df_itens().copy()
             status_map = {r.item_nome: r.status for r in status_itens(dfm).itertuples(index=False)}
-            # opções pelo nome do item; formatador mostra categoria + status
             opcoes = itens_all['item_nome'].tolist()
             escolha = st.selectbox(
                 "Item do catálogo (pode estar emprestado)",
@@ -260,7 +270,6 @@ with abas[0]:
                 placeholder="Digite para buscar...",
                 format_func=lambda x: f"{x} ({itens_all.loc[itens_all['item_nome']==x, 'categoria'].values[0]}) — {status_map.get(x, 'Disponível')}",
             )
-            # Campo opcional para item novo mesmo em modo catálogo
             novo_item = st.text_input("Ou digite um novo item (será adicionado automaticamente)")
             if novo_item.strip():
                 item_nome = novo_item.strip()
@@ -284,7 +293,6 @@ with abas[0]:
         if aluno_sel:
             try:
                 nome_pref, rest = aluno_sel.split(" ", 1)
-                # dividir melhor: pega última palavra como sobrenome quando não há travessão
                 if "—" in rest:
                     sobrenome_pref, serie_pref = [p.strip() for p in rest.split("—", 1)]
                 else:
@@ -345,13 +353,16 @@ with abas[1]:
         )
         if st.button("↩️ Registrar Devolução", use_container_width=True):
             linha = emprestados[emprestados['item_nome']==chave].iloc[0]
+            mv_item = dfm[dfm['item_nome']==linha['item_nome']].copy()
+            mv_item['timestamp'] = pd.to_datetime(mv_item['timestamp'], errors='coerce')
+            mv_item = mv_item.sort_values('timestamp').tail(1).iloc[0] if not mv_item.empty else None
             registrar_mov(
                 tipo="Devolucao",
                 item_nome=linha['item_nome'],
                 categoria=linha['categoria'],
-                nome=str(linha['aluno']).split()[0] if str(linha['aluno']) else "",
-                sobrenome=" ".join(str(linha['aluno']).split()[1:]) if str(linha['aluno']) else "",
-                serie=linha['turma'],
+                nome=(mv_item['aluno_nome'] if mv_item is not None else ""),
+                sobrenome=(mv_item['aluno_sobrenome'] if mv_item is not None else ""),
+                serie=(mv_item['aluno_serie'] if mv_item is not None else ""),
                 prev_dev=None,
                 responsavel=st.session_state.get("responsavel", ""),
                 observ="",
@@ -398,14 +409,12 @@ with abas[2]:
             incluir_status = st.checkbox("Incluir aba 'status_atual'", value=True)
 
         if st.button("Gerar planilha (.xlsx)"):
-            # filtra por período
             per = dfm.copy()
             per['ts'] = pd.to_datetime(per['timestamp'], errors='coerce')
             ini = datetime.combine(data_ini, datetime.min.time())
             fim = datetime.combine(data_fim, datetime.max.time())
             per = per[(per['ts'] >= ini) & (per['ts'] <= fim)].drop(columns=['ts'])
 
-            # Reorganiza colunas para ficar fácil de ler
             cols_novas = [
                 ("Data", "data"),
                 ("Hora", "hora"),
@@ -422,46 +431,59 @@ with abas[2]:
             per_export = per[[c for _, c in cols_novas]].rename(columns=dict(cols_novas)) if not per.empty else pd.DataFrame(columns=[k for k,_ in cols_novas])
 
             buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                # Sempre criar pelo menos uma planilha visível
-                if per_export.empty:
-                    # cria uma aba com cabeçalhos e uma linha informativa
-                    vazio = per_export.copy()
-                    vazio.loc[0] = [""] * len(vazio.columns)
-                    vazio.loc[0, 'Obs.'] = f"Sem registros entre {data_ini.strftime('%d/%m/%Y')} e {data_fim.strftime('%d/%m/%Y')}"
-                    vazio.to_excel(writer, sheet_name='emprestimos', index=False)
-                else:
-                    per_export.sort_values(['Data','Hora'], ascending=True).to_excel(writer, sheet_name='emprestimos', index=False)
 
-                # opcional: status atual simples (só cria se solicitado e houver dados)
+            # Usa XlsxWriter por padrão; fallback para openpyxl
+            try:
+                import xlsxwriter  # noqa: F401
+                engine_name = 'xlsxwriter'
+            except Exception:
+                engine_name = 'openpyxl'
+
+            with pd.ExcelWriter(buffer, engine=engine_name) as writer:
+                # >>> Ordenação segura antes de exportar (evita KeyError: 'Data')
+                try:
+                    order_cols = [c for c in ['Data', 'Hora'] if c in per_export.columns]
+                    if order_cols:
+                        per_sorted = per_export.sort_values(order_cols, ascending=True)
+                    else:
+                        per_sorted = per_export
+                except Exception:
+                    per_sorted = per_export
+
+                # Garante que haja pelo menos uma aba visível
+                if per_sorted.empty:
+                    msg = pd.DataFrame([{ "Info": f"Sem registros entre {data_ini.strftime('%d/%m/%Y')} e {data_fim.strftime('%d/%m/%Y')}" }])
+                    msg.to_excel(writer, sheet_name='emprestimos', index=False)
+                else:
+                    per_sorted.to_excel(writer, sheet_name='emprestimos', index=False)
+
                 if incluir_status and not dfs.empty:
-                    sa = dfs.copy()
-                    sa = sa.rename(columns={
-                        'item_nome':'Item', 'categoria':'Categoria', 'status':'Status', 'aluno':'Aluno', 'turma':'Série', 'prev_devolucao':'Prev. Devolução'
+                    sa = dfs.rename(columns={
+                        'item_nome': 'Item', 'categoria': 'Categoria', 'status': 'Status',
+                        'aluno': 'Aluno', 'turma': 'Série', 'prev_devolucao': 'Prev. Devolução'
                     })
                     sa.to_excel(writer, sheet_name='status_atual', index=False)
 
-                # formatação leve (só se a planilha existir)
-                if 'emprestimos' in writer.sheets:
-                    ws = writer.sheets['emprestimos']
-                    for col in ws.columns:
-                        maxlen = 10
-                        for cell in col:
-                            try:
-                                maxlen = max(maxlen, len(str(cell.value)))
-                            except Exception:
-                                pass
-                        ws.column_dimensions[col[0].column_letter].width = min(maxlen+2, 40)
-                if 'status_atual' in writer.sheets:
-                    ws2 = writer.sheets['status_atual']
-                    for col in ws2.columns:
-                        maxlen = 10
-                        for cell in col:
-                            try:
-                                maxlen = max(maxlen, len(str(cell.value)))
-                            except Exception:
-                                pass
-                        ws2.column_dimensions[col[0].column_letter].width = min(maxlen+2, 40)
+                # Pós-escrita: ativa primeira sheet / ajustes
+                try:
+                    if engine_name == 'openpyxl':
+                        wb = writer.book
+                        if not wb.worksheets:
+                            ws = wb.create_sheet('emprestimos')
+                            ws['A1'] = 'Info'
+                            ws['B1'] = f"Sem registros entre {data_ini.strftime('%d/%m/%Y')} e {data_fim.strftime('%d/%m/%Y')}"
+                        if wb.worksheets:
+                            wb.active = 0
+                            for ws in wb.worksheets:
+                                ws.sheet_state = 'visible'
+                    else:
+                        ws = writer.sheets.get('emprestimos')
+                        if ws is not None and not per_sorted.empty:
+                            for idx, col in enumerate(per_sorted.columns):
+                                width = min(max(per_sorted[col].astype(str).map(len).max() if not per_sorted.empty else 10, len(col)) + 2, 40)
+                                ws.set_column(idx, idx, width)
+                except Exception:
+                    pass
 
             buffer.seek(0)
             nome = f"sala_leitura_{data_ini.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}.xlsx"
@@ -477,7 +499,8 @@ with abas[3]:
     st.subheader("Catálogo de Itens (opcional)")
     st.caption("Mesmo sem cadastrar aqui, itens são adicionados automaticamente quando emprestados.")
 
-    if dfi.empty:
+    dfi_curr = df_itens()
+    if dfi_curr.empty:
         st.info("Nenhum item cadastrado manualmente. Adicione abaixo se quiser.")
 
     with st.form("novo_item"):
@@ -491,7 +514,8 @@ with abas[3]:
             upsert_item(item_nome_in, categoria_in)
             st.success("Item adicionado ao catálogo.")
 
-    if not df_itens().empty:
+    dfi_novo = df_itens()
+    if not dfi_novo.empty:
         st.markdown("### Itens cadastrados")
-        st.dataframe(df_itens(), use_container_width=True, hide_index=True)
+        st.dataframe(dfi_novo, use_container_width=True, hide_index=True)
         st.caption("Para remover/editar rapidamente: use um editor SQLite (opcional) ou empreste/devolva normalmente.")
