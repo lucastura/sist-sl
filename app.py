@@ -1,8 +1,16 @@
 # ==============================
-# app.py (v2.3 – ordenação segura + XlsxWriter por padrão)
+# app.py (v3.0 – Catálogo + Empréstimo Professor + Devolução parcial)
 # ==============================
 # Sala de Leitura – Empréstimos de Livros e Jogos
 # UI: Streamlit | Banco: SQLite (sala_leitura.db)
+#
+# Novidades v3.0
+# - Aba **Catálogo** com importação de planilha (mapeamento de colunas)
+# - Campos do catálogo: titulo, autor, editora, genero, isbn, edicao (Numero), quant_total (unidades)
+# - **Empréstimo Professor**: multitítulo e multiquantidade
+# - **Devolução parcial** por quantidade
+# - Exportar Catálogo completo e Todos os Empréstimos
+# - Mantém fluxo de aluno, autocomplete, exportação por período
 #
 # Requisitos:
 #   pip install -r requirements.txt
@@ -19,25 +27,26 @@ import sqlite3
 from io import BytesIO
 
 DB_PATH = Path("sala_leitura.db")
-ABA_ITENS_TEXTO = "🗂️ Itens (opcional)"
 
+# ---------------- Campos padrão ----------------
 COLS_MOV = [
-    "timestamp",      # ISO
-    "data",           # dd/mm/yyyy
-    "hora",           # HH:MM:SS
-    "tipo",           # Emprestimo|Devolucao
-    "item_nome",
-    "categoria",      # Livro|Jogo|Outro
-    "aluno_nome",
-    "aluno_sobrenome",
-    "aluno_serie",
-    "responsavel",    # quem operou
-    "prev_devolucao", # dd/mm/yyyy
-    "observacoes",
+    "timestamp","data","hora","tipo",           # Emprestimo, Devolucao, Renovacao (se desejar futuramente)
+    "item_nome","categoria",                      # categoria mantida para compatibilidade
+    "aluno_nome","aluno_sobrenome","aluno_serie",
+    "responsavel","prev_devolucao","observacoes",
+    # novos:
+    "quantidade",                                   # int (padrão 1)
+    "beneficiario_tipo",                            # 'aluno' | 'professor' | ''
+    "beneficiario_nome",                            # nome do professor (ou vazio)
 ]
 
-COLS_ITENS = ["item_nome", "categoria"]
-COLS_ALUNOS = ["nome", "sobrenome", "serie"]
+COLS_ITENS = [
+    "item_nome","categoria",                      # compatibilidade
+    "titulo","autor","editora","genero","isbn","edicao",
+    "quant_total",                                  # unidades no acervo
+]
+
+COLS_ALUNOS = ["nome","sobrenome","serie"]
 
 # ---------------- SQLite helpers ----------------
 
@@ -54,6 +63,7 @@ def _table_has_column(con, table, column):
 def init_db():
     with get_conn() as con:
         cur = con.cursor()
+        # movimentacoes
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS movimentacoes (
@@ -69,19 +79,31 @@ def init_db():
                 aluno_serie TEXT,
                 responsavel TEXT,
                 prev_devolucao TEXT,
-                observacoes TEXT
+                observacoes TEXT,
+                quantidade INTEGER DEFAULT 1,
+                beneficiario_tipo TEXT DEFAULT '',
+                beneficiario_nome TEXT DEFAULT ''
             );
             """
         )
+        # itens (catálogo)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS itens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_nome TEXT UNIQUE,
-                categoria TEXT
+                item_nome TEXT UNIQUE,      -- rótulo curto/antigo (opcional)
+                categoria TEXT,             -- compatibilidade (p.ex. Livro/Jogo)
+                titulo TEXT,
+                autor TEXT,
+                editora TEXT,
+                genero TEXT,
+                isbn TEXT,
+                edicao TEXT,
+                quant_total INTEGER DEFAULT 1
             );
             """
         )
+        # alunos (autocomplete)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS alunos (
@@ -95,25 +117,20 @@ def init_db():
         )
         con.commit()
 
-        # Migração leve: garante colunas
-        for col, default in [
-            ("item_nome", "''"),
-            ("categoria", "''"),
-            ("aluno_nome", "''"),
-            ("aluno_sobrenome", "''"),
-            ("aluno_serie", "''"),
-            ("responsavel", "''"),
-            ("prev_devolucao", "''"),
-            ("observacoes", "''"),
+        # Migrações leves de segurança
+        for col, ddl in [
+            ("quantidade", "INTEGER DEFAULT 1"),
+            ("beneficiario_tipo", "TEXT DEFAULT ''"),
+            ("beneficiario_nome", "TEXT DEFAULT ''"),
         ]:
             if not _table_has_column(con, "movimentacoes", col):
-                con.execute(f"ALTER TABLE movimentacoes ADD COLUMN {col} TEXT DEFAULT {default}")
-        for col in ["item_nome", "categoria"]:
+                con.execute(f"ALTER TABLE movimentacoes ADD COLUMN {col} {ddl}")
+        for col, ddl in [
+            ("titulo","TEXT"),("autor","TEXT"),("editora","TEXT"),("genero","TEXT"),
+            ("isbn","TEXT"),("edicao","TEXT"),("quant_total","INTEGER DEFAULT 1"),
+        ]:
             if not _table_has_column(con, "itens", col):
-                con.execute(f"ALTER TABLE itens ADD COLUMN {col} TEXT")
-        for col in ["nome", "sobrenome", "serie"]:
-            if not _table_has_column(con, "alunos", col):
-                con.execute(f"ALTER TABLE alunos ADD COLUMN {col} TEXT")
+                con.execute(f"ALTER TABLE itens ADD COLUMN {col} {ddl}")
         con.commit()
 
 @st.cache_data(ttl=5)
@@ -121,23 +138,30 @@ def df_mov() -> pd.DataFrame:
     init_db()
     with get_conn() as con:
         df = pd.read_sql_query(
-            "SELECT timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,responsavel,prev_devolucao,observacoes FROM movimentacoes",
+            "SELECT timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,"
+            "responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome FROM movimentacoes",
             con,
         )
     if df.empty:
         return pd.DataFrame(columns=COLS_MOV)
     for c in COLS_MOV:
         if c not in df.columns:
-            df[c] = ""
+            df[c] = "" if c not in ("quantidade",) else 0
+    if "quantidade" in df.columns:
+        df["quantidade"] = pd.to_numeric(df["quantidade"], errors="coerce").fillna(0).astype(int)
     return df[COLS_MOV].copy()
 
 @st.cache_data(ttl=5)
 def df_itens() -> pd.DataFrame:
     init_db()
     with get_conn() as con:
-        df = pd.read_sql_query("SELECT item_nome,categoria FROM itens", con)
+        df = pd.read_sql_query(
+            "SELECT item_nome,categoria,titulo,autor,editora,genero,isbn,edicao,quant_total FROM itens",
+            con,
+        )
     if df.empty:
         return pd.DataFrame(columns=COLS_ITENS)
+    df["quant_total"] = pd.to_numeric(df["quant_total"], errors="coerce").fillna(0).astype(int)
     return df[COLS_ITENS].fillna("")
 
 @st.cache_data(ttl=5)
@@ -149,373 +173,458 @@ def df_alunos() -> pd.DataFrame:
         return pd.DataFrame(columns=COLS_ALUNOS)
     return df[COLS_ALUNOS].fillna("")
 
+# CRUD helpers
+
 def inserir_movimento(reg: dict):
     init_db()
+    reg2 = {**{c: (0 if c=="quantidade" else "") for c in COLS_MOV}, **reg}
+    if not reg2.get("quantidade"):
+        reg2["quantidade"] = 1
     with get_conn() as con:
         con.execute(
             """
             INSERT INTO movimentacoes (
-                timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,responsavel,prev_devolucao,observacoes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,
+                responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            [reg.get(c, "") for c in COLS_MOV],
+            [reg2.get(c, "") for c in COLS_MOV],
         )
         con.commit()
     df_mov.clear()
 
-def upsert_item(item_nome: str, categoria: str):
-    if not item_nome.strip():
-        return
+def upsert_item_catalogo(**campos):
+    # chave preferencial: isbn; fallback: titulo+autor+edicao
     init_db()
     with get_conn() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO itens (item_nome,categoria) VALUES (?,?)",
-            (item_nome.strip(), (categoria or "Livro").strip()),
-        )
+        isbn = (campos.get("isbn") or "").strip()
+        titulo = (campos.get("titulo") or "").strip()
+        autor = (campos.get("autor") or "").strip()
+        edicao = (campos.get("edicao") or "").strip()
+        # tenta localizar
+        if isbn:
+            cur = con.execute("SELECT id FROM itens WHERE isbn=?", (isbn,))
+            row = cur.fetchone()
+        else:
+            cur = con.execute("SELECT id FROM itens WHERE (titulo=? AND autor=? AND IFNULL(edicao,'')=?)",
+                              (titulo, autor, edicao))
+            row = cur.fetchone()
+        campos.setdefault("quant_total", 1)
+        campos.setdefault("categoria", "Livro")
+        campos.setdefault("item_nome", titulo or isbn or autor)
+        if row:
+            set_clause = ",".join([f"{k}=?" for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"]])
+            params = [campos.get(k) for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"]] + [row[0]]
+            con.execute(f"UPDATE itens SET {set_clause} WHERE id=?", params)
+        else:
+            con.execute(
+                """
+                INSERT INTO itens (item_nome,categoria,titulo,autor,editora,genero,isbn,edicao,quant_total)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                [campos.get(k) for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"]],
+            )
         con.commit()
     df_itens.clear()
 
-def upsert_aluno(nome: str, sobrenome: str, serie: str):
-    if not (nome.strip() or sobrenome.strip()):
-        return
-    init_db()
-    with get_conn() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO alunos (nome,sobrenome,serie) VALUES (?,?,?)",
-            (nome.strip(), sobrenome.strip(), serie.strip()),
-        )
-        con.commit()
-    df_alunos.clear()
+# ---------------- Disponibilidade / saldos ----------------
 
-# ---------------- Regras de disponibilidade ----------------
+def saldo_por_item(dfm: pd.DataFrame) -> pd.DataFrame:
+    """Retorna DataFrame com cols: item_nome, titulo, quant_total, emprestado, disponivel"""
+    dfi = df_itens()
+    if dfi.empty:
+        base = pd.DataFrame(columns=["item_nome","titulo","quant_total"]).copy()
+    else:
+        base = dfi[["item_nome","titulo","quant_total"]].copy()
+    if dfm.empty:
+        base["emprestado"] = 0
+        base["disponivel"] = base["quant_total"]
+        return base
+    mov = dfm.copy()
+    mov["quantidade"] = pd.to_numeric(mov["quantidade"], errors="coerce").fillna(0).astype(int)
+    mov["sinal"] = mov["tipo"].str.lower().map(lambda t: 1 if t.startswith("emprest") else (-1 if t.startswith("devolu") else 0))
+    mov["delta"] = mov["quantidade"] * mov["sinal"]
+    agg = mov.groupby("item_nome")["delta"].sum().rename("emprestado").reset_index()
+    out = base.merge(agg, on="item_nome", how="left").fillna({"emprestado":0})
+    out["emprestado"] = out["emprestado"].astype(int).clip(lower=0)
+    out["disponivel"] = (out["quant_total"] - out["emprestado"]).clip(lower=0)
+    return out
+
+# status para visualização (último evento + saldos)
 
 def status_itens(dfm: pd.DataFrame) -> pd.DataFrame:
+    dfi = df_itens()
+    sal = saldo_por_item(dfm)
     if dfm.empty:
-        return pd.DataFrame(columns=["item_nome", "categoria", "status", "aluno", "turma", "prev_devolucao"])    
-    df = dfm.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    idx = df.sort_values("timestamp").groupby("item_nome").tail(1).index
-    ult = df.loc[idx].copy()
-    ult["status"] = ult["tipo"].apply(lambda t: "Emprestado" if str(t).lower().startswith("emprest") else "Disponível")
-    ult["aluno"] = (ult["aluno_nome"].fillna("") + " " + ult["aluno_sobrenome"].fillna("")).str.strip()
-    ult["turma"] = ult["aluno_serie"].fillna("")
-    out = ult[["item_nome", "categoria", "status", "aluno", "turma", "prev_devolucao"]].reset_index(drop=True)
-    return out
+        ult = pd.DataFrame(columns=["item_nome","categoria","status","aluno","turma","prev_devolucao"])    
+    else:
+        df = dfm.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        idx = df.sort_values("timestamp").groupby("item_nome").tail(1).index
+        ult = df.loc[idx, ["item_nome","categoria","tipo","aluno_nome","aluno_sobrenome","aluno_serie","prev_devolucao"]].copy()
+        ult["status"] = ult["tipo"].apply(lambda t: "Emprestado" if str(t).lower().startswith("emprest") else "Disponível")
+        ult["aluno"] = (ult["aluno_nome"].fillna("") + " " + ult["aluno_sobrenome"].fillna("")).str.strip()
+        ult["turma"] = ult["aluno_serie"].fillna("")
+        ult = ult[["item_nome","categoria","status","aluno","turma","prev_devolucao"]]
+    # junta saldos e titulo
+    if not dfi.empty:
+        ult = ult.merge(dfi[["item_nome","titulo"]], on="item_nome", how="right").fillna("")
+    else:
+        ult["titulo"] = ult["item_nome"]
+    ult = ult.merge(sal[["item_nome","quant_total","emprestado","disponivel"]], on="item_nome", how="left").fillna({"quant_total":0,"emprestado":0,"disponivel":0})
+    return ult
 
 # ---------------- UI ----------------
 
-st.set_page_config(page_title="Sala de Leitura - Empréstimos", page_icon="📚", layout="wide")
-st.title("📚 Sala de Leitura – Empréstimos de Livros e Jogos")
+st.set_page_config(page_title="Sala de Leitura - Sistema", page_icon="📚", layout="wide")
+st.title("📚 Sala de Leitura – Sistema Oficial")
 
 with st.sidebar:
     st.header("Configurações rápidas")
     resp = st.text_input("Responsável de hoje", value=st.session_state.get("responsavel", ""))
     st.session_state["responsavel"] = resp
-    padrao_prazo = st.number_input("Dias de empréstimo (padrão)", min_value=1, max_value=30, value=3)
-    st.markdown("---")
-    st.caption("Banco de dados:")
-    st.code(str(DB_PATH.resolve()))
+    st.caption(f"Banco: {DB_PATH.resolve()}")
 
-abas = st.tabs(["➕ Empréstimo", "↩️ Devolução", "🔎 Consulta / Exportar", ABA_ITENS_TEXTO])
+abas = st.tabs([
+    "➕ Empréstimo Aluno",
+    "👩‍🏫 Empréstimo Professor",
+    "↩️ Devolução (parcial)",
+    "📚 Catálogo",
+    "🔎 Consulta / Exportar",
+])
 
 # ------ Dados atuais ------
 dfm = df_mov()
 dfi = df_itens()
 dfa = df_alunos()
-dfs = status_itens(dfm)
+stat = status_itens(dfm)
+saldos = saldo_por_item(dfm)
 
 # Autocomplete de aluno
 alunos_options = []
 if not dfa.empty:
     alunos_options = [f"{r.nome} {r.sobrenome} — {r.serie}".strip() for r in dfa.itertuples(index=False)]
 
-# ------ Função registrar ------
+# Helpers de registro
 
-def registrar_mov(tipo: str, item_nome: str, categoria: str, nome: str, sobrenome: str, serie: str, prev_dev: datetime | None, responsavel: str, observ: str):
+def _base_registro(tipo:str, item_nome:str, categoria:str, quantidade:int, prev_dev:datetime|None, observ:str,
+                   aluno_nome:str="", aluno_sobrenome:str="", aluno_serie:str="",
+                   beneficiario_tipo:str="aluno", beneficiario_nome:str=""):
     agora = datetime.now()
-    reg = {
+    inserir_movimento({
         "timestamp": agora.isoformat(timespec='seconds'),
         "data": agora.strftime('%d/%m/%Y'),
         "hora": agora.strftime('%H:%M:%S'),
         "tipo": tipo,
         "item_nome": item_nome,
-        "categoria": categoria,
-        "aluno_nome": nome,
-        "aluno_sobrenome": sobrenome,
-        "aluno_serie": serie,
-        "responsavel": responsavel,
+        "categoria": categoria or "Livro",
+        "aluno_nome": aluno_nome,
+        "aluno_sobrenome": aluno_sobrenome,
+        "aluno_serie": aluno_serie,
+        "responsavel": st.session_state.get("responsavel", ""),
         "prev_devolucao": prev_dev.strftime('%d/%m/%Y') if prev_dev else "",
         "observacoes": observ,
-    }
-    upsert_aluno(nome, sobrenome, serie)
-    upsert_item(item_nome, categoria)
-    inserir_movimento(reg)
-    st.success(f"{tipo} registrado: {item_nome} → {nome} {sobrenome} ({serie}).")
+        "quantidade": int(quantidade) if quantidade else 1,
+        "beneficiario_tipo": beneficiario_tipo,
+        "beneficiario_nome": beneficiario_nome,
+    })
 
-# ------ Aba Empréstimo ------
+# ------ Aba: Empréstimo Aluno ------
 with abas[0]:
-    st.subheader("Registrar Empréstimo")
+    st.subheader("Empréstimo para Aluno")
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        usar_catalogo = st.toggle("Selecionar item a partir do catálogo (aba Itens)", value=not df_itens().empty)
-        if usar_catalogo and not df_itens().empty:
-            itens_all = df_itens().copy()
-            status_map = {r.item_nome: r.status for r in status_itens(dfm).itertuples(index=False)}
-            opcoes = itens_all['item_nome'].tolist()
-            escolha = st.selectbox(
-                "Item do catálogo (pode estar emprestado)",
-                opcoes,
-                index=None,
-                placeholder="Digite para buscar...",
-                format_func=lambda x: f"{x} ({itens_all.loc[itens_all['item_nome']==x, 'categoria'].values[0]}) — {status_map.get(x, 'Disponível')}",
-            )
-            novo_item = st.text_input("Ou digite um novo item (será adicionado automaticamente)")
-            if novo_item.strip():
-                item_nome = novo_item.strip()
-                categoria = st.selectbox("Categoria do novo item", ["Livro", "Jogo", "Outro"], index=0, key="cat_novo_item")
-            elif escolha:
-                item_nome = escolha
-                categoria = itens_all.loc[itens_all['item_nome']==escolha, 'categoria'].values[0]
-            else:
-                item_nome = ""; categoria = "Livro"
+        # escolha de item do catálogo
+        if dfi.empty:
+            st.warning("Catálogo vazio. Adicione na aba Catálogo.")
+            opcoes = []
         else:
-            item_nome = st.text_input("Nome do item *")
-            categoria = st.selectbox("Categoria", ["Livro", "Jogo", "Outro"], index=0)
+            opcoes = dfi.sort_values(["titulo"]).apply(lambda r: f"{r['titulo']} (disp: {int(saldos.loc[saldos['item_nome']==r['item_nome'],'disponivel'].values[0]) if (saldos['item_nome']==r['item_nome']).any() else r['quant_total']})", axis=1).tolist()
+        # map label -> item_nome
+        labels = {}
+        if not dfi.empty:
+            for r in dfi.itertuples(index=False):
+                disp = int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)
+                labels[r.item_nome] = f"{r.titulo or r.item_nome} (disp: {disp})"
+        escolha = st.selectbox("Livro", options=list(labels.keys()) if labels else [], format_func=lambda k: labels.get(k, k), index=None)
+        quantidade = st.number_input("Quantidade", min_value=1, value=1)
+        dias = st.number_input("Prazo (dias)", min_value=1, max_value=60, value=7)
+        prev_dev = datetime.now() + timedelta(days=int(dias))
+        st.caption(f"Prev. devolução: {prev_dev.strftime('%d/%m/%Y')}")
 
         st.markdown("### Aluno")
-        aluno_sel = st.selectbox(
-            "Aluno (autocomplete)",
-            alunos_options if alunos_options else [""],
-            index=None,
-            placeholder="Buscar aluno já cadastrado...",
-        )
+        aluno_sel = st.selectbox("Aluno (autocomplete)", alunos_options if alunos_options else [""], index=None, placeholder="Buscar aluno já cadastrado...")
+        nome_pref = sobrenome_pref = serie_pref = ""
         if aluno_sel:
             try:
                 nome_pref, rest = aluno_sel.split(" ", 1)
                 if "—" in rest:
                     sobrenome_pref, serie_pref = [p.strip() for p in rest.split("—", 1)]
-                else:
-                    partes = rest.strip().split()
-                    sobrenome_pref = partes[-1] if partes else ""
-                    serie_pref = ""
             except Exception:
-                nome_pref = aluno_sel; sobrenome_pref = ""; serie_pref = ""
-        else:
-            nome_pref = sobrenome_pref = serie_pref = ""
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            nome = st.text_input("Nome *", value=nome_pref)
-        with c2:
-            sobrenome = st.text_input("Sobrenome *", value=sobrenome_pref)
-        with c3:
-            serie = st.text_input("Série *", value=serie_pref, placeholder="Ex.: 1º B")
-
-        dias = st.number_input("Prazo (dias)", min_value=1, max_value=30, value=int(st.session_state.get("prazo_padrao", 3)))
-        prev_dev = datetime.now() + timedelta(days=int(dias))
-        st.write("**Prev. devolução:** ", prev_dev.strftime('%d/%m/%Y'))
+                nome_pref = aluno_sel
+        c1,c2,c3 = st.columns(3)
+        with c1: nome = st.text_input("Nome *", value=nome_pref)
+        with c2: sobrenome = st.text_input("Sobrenome *", value=sobrenome_pref)
+        with c3: serie = st.text_input("Série *", value=serie_pref)
         observ = st.text_input("Observações")
 
     with col2:
-        st.markdown("### ")
-        pode = (item_nome.strip() != "" and nome.strip() != "" and sobrenome.strip() != "" and serie.strip() != "")
+        pode = bool(escolha) and nome.strip() and sobrenome.strip() and serie.strip() and quantidade>0
         if st.button("✅ Registrar Empréstimo", use_container_width=True, disabled=not pode):
-            registrar_mov(
+            # salva aluno para autocomplete
+            if nome.strip() or sobrenome.strip():
+                with get_conn() as con:
+                    con.execute("INSERT OR IGNORE INTO alunos (nome,sobrenome,serie) VALUES (?,?,?)", (nome.strip(), sobrenome.strip(), serie.strip()))
+                    con.commit()
+                df_alunos.clear()
+            _base_registro(
                 tipo="Emprestimo",
-                item_nome=item_nome,
-                categoria=categoria,
-                nome=nome,
-                sobrenome=sobrenome,
-                serie=serie,
+                item_nome=escolha,
+                categoria="Livro",
+                quantidade=quantidade,
                 prev_dev=prev_dev,
-                responsavel=st.session_state.get("responsavel", ""),
                 observ=observ,
+                aluno_nome=nome, aluno_sobrenome=sobrenome, aluno_serie=serie,
+                beneficiario_tipo="aluno", beneficiario_nome="",
             )
+            st.success("Empréstimo registrado.")
 
     st.markdown("---")
-    st.caption("Itens atualmente emprestados")
-    st.dataframe(dfs[dfs['status']=="Emprestado"], use_container_width=True, hide_index=True)
+    st.caption("Saldos do catálogo")
+    st.dataframe(status_itens(df_mov()), use_container_width=True, hide_index=True)
 
-# ------ Aba Devolução ------
+# ------ Aba: Empréstimo Professor ------
 with abas[1]:
-    st.subheader("Registrar Devolução")
-    emprestados = dfs[dfs['status']=="Emprestado"].copy()
-    if emprestados.empty:
-        st.info("Não há itens emprestados no momento.")
+    st.subheader("Empréstimo para Professor (multitítulo / multiquantidade)")
+    if dfi.empty:
+        st.warning("Catálogo vazio. Adicione na aba Catálogo.")
     else:
-        chave = st.selectbox(
-            "Selecione o item a devolver",
-            emprestados['item_nome'].tolist(),
-            format_func=lambda k: (
-                f"{k} – {emprestados.loc[emprestados['item_nome']==k, 'aluno'].values[0]}"
-            ),
-        )
-        if st.button("↩️ Registrar Devolução", use_container_width=True):
-            linha = emprestados[emprestados['item_nome']==chave].iloc[0]
-            mv_item = dfm[dfm['item_nome']==linha['item_nome']].copy()
-            mv_item['timestamp'] = pd.to_datetime(mv_item['timestamp'], errors='coerce')
-            mv_item = mv_item.sort_values('timestamp').tail(1).iloc[0] if not mv_item.empty else None
-            registrar_mov(
-                tipo="Devolucao",
-                item_nome=linha['item_nome'],
-                categoria=linha['categoria'],
-                nome=(mv_item['aluno_nome'] if mv_item is not None else ""),
-                sobrenome=(mv_item['aluno_sobrenome'] if mv_item is not None else ""),
-                serie=(mv_item['aluno_serie'] if mv_item is not None else ""),
-                prev_dev=None,
-                responsavel=st.session_state.get("responsavel", ""),
-                observ="",
-            )
+        prof = st.text_input("Nome do Professor *")
+        dias_p = st.number_input("Prazo (dias)", min_value=1, max_value=120, value=14)
+        prev_p = datetime.now() + timedelta(days=int(dias_p))
+        st.caption(f"Prev. devolução: {prev_p.strftime('%d/%m/%Y')}")
+
+        st.markdown("### Seleção de livros")
+        # multiseleção por item_nome
+        labels = {r.item_nome: f"{r.titulo or r.item_nome} (disp: {int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)})" for r in dfi.itertuples(index=False)}
+        escolhidos = st.multiselect("Escolha livros", options=list(labels.keys()), format_func=lambda k: labels.get(k,k))
+
+        qts = {}
+        for k in escolhidos:
+            disp = int(saldos.loc[saldos['item_nome']==k,'disponivel'].values[0]) if (saldos['item_nome']==k).any() else int(dfi.loc[dfi['item_nome']==k,'quant_total'].values[0])
+            qts[k] = st.number_input(f"Quantidade para {labels[k]}", min_value=1, max_value=max(1, disp if disp>0 else 1), value=min(1, disp) if disp>0 else 1, key=f"q_{k}")
+        observ_p = st.text_input("Observações gerais")
+
+        pode = prof.strip() and len(escolhidos)>0 and all((qts[k] or 0)>0 for k in escolhidos)
+        if st.button("✅ Registrar Empréstimos do Professor", use_container_width=True, disabled=not pode):
+            for k in escolhidos:
+                _base_registro(
+                    tipo="Emprestimo",
+                    item_nome=k,
+                    categoria="Livro",
+                    quantidade=int(qts[k]),
+                    prev_dev=prev_p,
+                    observ=observ_p,
+                    beneficiario_tipo="professor", beneficiario_nome=prof.strip(),
+                )
+            st.success(f"Empréstimos registrados para {prof}.")
+
+# ------ Aba: Devolução (parcial) ------
+with abas[2]:
+    st.subheader("Devolução (parcial ou total)")
+    if dfi.empty:
+        st.info("Catálogo vazio.")
+    else:
+        # Mostra itens com emprestado>0
+        sal_emprest = saldos[saldos["emprestado"]>0].copy()
+        if sal_emprest.empty:
+            st.info("Não há itens emprestados no momento.")
+        else:
+            labels = {r.item_nome: f"{r.item_nome} – {int(r.emprestado)} emprestado(s)" for r in sal_emprest.itertuples(index=False)}
+            chosen = st.selectbox("Selecione o item", options=list(labels.keys()), format_func=lambda k: labels.get(k,k))
+            emprestado_q = int(sal_emprest.loc[sal_emprest['item_nome']==chosen,'emprestado'].values[0])
+            qtd_dev = st.number_input("Quantidade a devolver", min_value=1, max_value=emprestado_q, value=emprestado_q)
+            observ_d = st.text_input("Observações")
+            if st.button("↩️ Registrar Devolução", use_container_width=True):
+                _base_registro(
+                    tipo="Devolucao",
+                    item_nome=chosen,
+                    categoria="Livro",
+                    quantidade=int(qtd_dev),
+                    prev_dev=None,
+                    observ=observ_d,
+                    beneficiario_tipo="", beneficiario_nome="",
+                )
+                st.success("Devolução registrada.")
 
     st.markdown("---")
-    st.caption("Resumo de disponibilidade")
-    st.dataframe(dfs, use_container_width=True, hide_index=True)
+    st.caption("Saldos atuais")
+    st.dataframe(status_itens(df_mov()), use_container_width=True, hide_index=True)
 
-# ------ Aba Consulta / Exportar ------
-with abas[2]:
-    st.subheader("Histórico, Busca e Exportação para Excel")
-    if dfm.empty:
-        st.info("Sem registros ainda.")
+# ------ Aba: Catálogo ------
+with abas[3]:
+    st.subheader("Catálogo (importar, adicionar, exportar)")
+
+    colA, colB = st.columns([1,1])
+    with colA:
+        st.markdown("### Importar Planilha (.xlsx)")
+        up = st.file_uploader("Selecione a planilha do catálogo", type=["xlsx"])
+        if up is not None:
+            try:
+                excel = pd.read_excel(up)
+                st.write("Pré-visualização (10 linhas):")
+                st.dataframe(excel.head(10), use_container_width=True, hide_index=True)
+                st.markdown("#### Mapeamento de colunas")
+                cols = ["— ignorar —"] + list(excel.columns)
+                map_titulo   = st.selectbox("Título (Nome do Livro)", cols, index=(cols.index("Nome do Livro") if "Nome do Livro" in cols else 0))
+                map_autor    = st.selectbox("Autor", cols, index=(cols.index("autor") if "autor" in cols else 0))
+                map_editora  = st.selectbox("Editora", cols, index=(cols.index("Editora") if "Editora" in cols else 0))
+                map_genero   = st.selectbox("Gênero", cols, index=(cols.index("genero") if "genero" in cols else 0))
+                map_isbn     = st.selectbox("ISBN", cols, index=(cols.index("isbn") if "isbn" in cols else 0))
+                map_edicao   = st.selectbox("Edição (Número)", cols, index=(cols.index("Número") if "Número" in cols else 0))
+                map_quant    = st.selectbox("Unidades", cols, index=(cols.index("unidades") if "unidades" in cols else 0))
+
+                if st.button("📥 Importar catálogo"):
+                    n_ok = 0
+                    for _, r in excel.iterrows():
+                        def pick(c):
+                            return (str(r[c]).strip() if (c and c in excel.columns and pd.notna(r[c])) else "")
+                        campos = {
+                            "titulo": pick(map_titulo) if map_titulo!="— ignorar —" else "",
+                            "autor": pick(map_autor) if map_autor!="— ignorar —" else "",
+                            "editora": pick(map_editora) if map_editora!="— ignorar —" else "",
+                            "genero": pick(map_genero) if map_genero!="— ignorar —" else "",
+                            "isbn": pick(map_isbn) if map_isbn!="— ignorar —" else "",
+                            "edicao": pick(map_edicao) if map_edicao!="— ignorar —" else "",
+                        }
+                        qt = pick(map_quant) if map_quant!="— ignorar —" else ""
+                        try:
+                            qt_i = int(float(qt)) if str(qt).strip()!="" else 1
+                        except Exception:
+                            qt_i = 1
+                        campos["quant_total"] = max(1, qt_i)
+                        campos["item_nome"] = campos["titulo"] or campos["isbn"] or campos["autor"]
+                        upsert_item_catalogo(**campos)
+                        n_ok += 1
+                    st.success(f"Importação concluída: {n_ok} registro(s).")
+            except Exception as e:
+                st.error(f"Falha ao ler Excel: {e}")
+
+    with colB:
+        st.markdown("### Adicionar Manualmente")
+        with st.form("form_add_item"):
+            c1,c2 = st.columns([2,1])
+            with c1:
+                titulo_in = st.text_input("Título *")
+                autor_in = st.text_input("Autor")
+                editora_in = st.text_input("Editora")
+                genero_in = st.text_input("Gênero")
+            with c2:
+                isbn_in = st.text_input("ISBN")
+                edicao_in = st.text_input("Edição (Número)")
+                quant_in = st.number_input("Unidades", min_value=1, value=1)
+            enviado = st.form_submit_button("Adicionar/Atualizar")
+            if enviado and titulo_in.strip():
+                upsert_item_catalogo(
+                    titulo=titulo_in.strip(), autor=autor_in.strip(), editora=editora_in.strip(), genero=genero_in.strip(),
+                    isbn=isbn_in.strip(), edicao=edicao_in.strip(), quant_total=int(quant_in), item_nome=titulo_in.strip(), categoria="Livro"
+                )
+                st.success("Catálogo atualizado.")
+
+    st.markdown("---")
+    st.caption("Catálogo atual")
+    st.dataframe(df_itens(), use_container_width=True, hide_index=True)
+
+    # Exportar catálogo
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine=("xlsxwriter" if st.runtime.exists() else "openpyxl")) as w:
+        if dfi.empty:
+            pd.DataFrame([{ "Info": "Catálogo vazio" }]).to_excel(w, sheet_name='catalogo', index=False)
+        else:
+            dfi.to_excel(w, sheet_name='catalogo', index=False)
+    buf.seek(0)
+    st.download_button("⬇️ Exportar catálogo (.xlsx)", data=buf.getvalue(), file_name="catalogo_sala_leitura.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ------ Aba: Consulta / Exportar ------
+with abas[4]:
+    st.subheader("Histórico, Busca e Exportações")
+    dfm_now = df_mov()
+    if dfm_now.empty:
+        st.info("Sem movimentações ainda.")
     else:
-        colf = st.columns(3)
+        colf = st.columns(4)
         with colf[0]:
             filtro_nome = st.text_input("Nome/Sobrenome contém")
         with colf[1]:
             filtro_item = st.text_input("Item contém")
         with colf[2]:
-            filtro_tipo = st.selectbox("Tipo", ["Todos", "Emprestimo", "Devolucao"], index=0)
+            filtro_tipo = st.selectbox("Tipo", ["Todos","Emprestimo","Devolucao"], index=0)
+        with colf[3]:
+            somente_prof = st.checkbox("Somente Professor")
 
-        view = dfm.copy()
+        view = dfm_now.copy()
         if filtro_nome:
             mask = view['aluno_nome'].fillna("").str.contains(filtro_nome, case=False) | \
-                   view['aluno_sobrenome'].fillna("").str.contains(filtro_nome, case=False)
+                   view['aluno_sobrenome'].fillna("").str.contains(filtro_nome, case=False) | \
+                   view['beneficiario_nome'].fillna("").str.contains(filtro_nome, case=False)
             view = view[mask]
         if filtro_item:
             view = view[view['item_nome'].fillna("").str.contains(filtro_item, case=False)]
         if filtro_tipo != "Todos":
             view = view[view['tipo']==filtro_tipo]
+        if somente_prof:
+            view = view[view['beneficiario_tipo']=="professor"]
+
         st.dataframe(view.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.subheader("📤 Exportar para Excel por período (layout simples)")
+        st.subheader("📤 Exportar (período)")
         hoje = date.today()
-        d1, d2, d3 = st.columns([1,1,1])
-        with d1:
+        c1,c2,c3 = st.columns([1,1,1])
+        with c1:
             data_ini = st.date_input("Início", value=hoje - timedelta(days=7))
-        with d2:
+        with c2:
             data_fim = st.date_input("Fim", value=hoje)
-        with d3:
+        with c3:
             incluir_status = st.checkbox("Incluir aba 'status_atual'", value=True)
 
-        if st.button("Gerar planilha (.xlsx)"):
-            per = dfm.copy()
+        if st.button("Gerar planilha de movimentações (.xlsx)"):
+            per = view.copy()
             per['ts'] = pd.to_datetime(per['timestamp'], errors='coerce')
             ini = datetime.combine(data_ini, datetime.min.time())
             fim = datetime.combine(data_fim, datetime.max.time())
             per = per[(per['ts'] >= ini) & (per['ts'] <= fim)].drop(columns=['ts'])
 
             cols_novas = [
-                ("Data", "data"),
-                ("Hora", "hora"),
-                ("Tipo", "tipo"),
-                ("Item", "item_nome"),
-                ("Categoria", "categoria"),
-                ("Nome", "aluno_nome"),
-                ("Sobrenome", "aluno_sobrenome"),
-                ("Série", "aluno_serie"),
-                ("Prev. Devolução", "prev_devolucao"),
-                ("Responsável", "responsavel"),
-                ("Obs.", "observacoes"),
+                ("Data","data"),("Hora","hora"),("Tipo","tipo"),("Item","item_nome"),("Categoria","categoria"),
+                ("Quantidade","quantidade"),("BeneficiárioTipo","beneficiario_tipo"),("BeneficiárioNome","beneficiario_nome"),
+                ("Nome","aluno_nome"),("Sobrenome","aluno_sobrenome"),("Série","aluno_serie"),
+                ("Prev. Devolução","prev_devolucao"),("Responsável","responsavel"),("Obs.","observacoes"),
             ]
-            per_export = per[[c for _, c in cols_novas]].rename(columns=dict(cols_novas)) if not per.empty else pd.DataFrame(columns=[k for k,_ in cols_novas])
-
+            per_export = per[[c for _,c in cols_novas]].rename(columns=dict(cols_novas)) if not per.empty else pd.DataFrame(columns=[k for k,_ in cols_novas])
             buffer = BytesIO()
-
-            # Usa XlsxWriter por padrão; fallback para openpyxl
-            try:
-                import xlsxwriter  # noqa: F401
-                engine_name = 'xlsxwriter'
-            except Exception:
-                engine_name = 'openpyxl'
-
-            with pd.ExcelWriter(buffer, engine=engine_name) as writer:
-                # >>> Ordenação segura antes de exportar (evita KeyError: 'Data')
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                 try:
-                    order_cols = [c for c in ['Data', 'Hora'] if c in per_export.columns]
-                    if order_cols:
-                        per_sorted = per_export.sort_values(order_cols, ascending=True)
-                    else:
-                        per_sorted = per_export
+                    order_cols = [c for c in ['Data','Hora'] if c in per_export.columns]
+                    per_sorted = per_export.sort_values(order_cols, ascending=True) if order_cols else per_export
                 except Exception:
                     per_sorted = per_export
-
-                # Garante que haja pelo menos uma aba visível
                 if per_sorted.empty:
-                    msg = pd.DataFrame([{ "Info": f"Sem registros entre {data_ini.strftime('%d/%m/%Y')} e {data_fim.strftime('%d/%m/%Y')}" }])
-                    msg.to_excel(writer, sheet_name='emprestimos', index=False)
+                    pd.DataFrame([{ "Info": f"Sem registros entre {data_ini:%d/%m/%Y} e {data_fim:%d/%m/%Y}" }]).to_excel(writer, sheet_name='emprestimos', index=False)
                 else:
                     per_sorted.to_excel(writer, sheet_name='emprestimos', index=False)
-
-                if incluir_status and not dfs.empty:
-                    sa = dfs.rename(columns={
-                        'item_nome': 'Item', 'categoria': 'Categoria', 'status': 'Status',
-                        'aluno': 'Aluno', 'turma': 'Série', 'prev_devolucao': 'Prev. Devolução'
-                    })
+                if incluir_status:
+                    sa = status_itens(df_mov())
                     sa.to_excel(writer, sheet_name='status_atual', index=False)
-
-                # Pós-escrita: ativa primeira sheet / ajustes
-                try:
-                    if engine_name == 'openpyxl':
-                        wb = writer.book
-                        if not wb.worksheets:
-                            ws = wb.create_sheet('emprestimos')
-                            ws['A1'] = 'Info'
-                            ws['B1'] = f"Sem registros entre {data_ini.strftime('%d/%m/%Y')} e {data_fim.strftime('%d/%m/%Y')}"
-                        if wb.worksheets:
-                            wb.active = 0
-                            for ws in wb.worksheets:
-                                ws.sheet_state = 'visible'
-                    else:
-                        ws = writer.sheets.get('emprestimos')
-                        if ws is not None and not per_sorted.empty:
-                            for idx, col in enumerate(per_sorted.columns):
-                                width = min(max(per_sorted[col].astype(str).map(len).max() if not per_sorted.empty else 10, len(col)) + 2, 40)
-                                ws.set_column(idx, idx, width)
-                except Exception:
-                    pass
-
             buffer.seek(0)
-            nome = f"sala_leitura_{data_ini.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}.xlsx"
-            st.download_button(
-                label=f"⬇️ Baixar {nome}",
-                data=buffer.getvalue(),
-                file_name=nome,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            nome = f"movimentacoes_{data_ini:%Y%m%d}_{data_fim:%Y%m%d}.xlsx"
+            st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ------ Aba Itens (opcional) ------
-with abas[3]:
-    st.subheader("Catálogo de Itens (opcional)")
-    st.caption("Mesmo sem cadastrar aqui, itens são adicionados automaticamente quando emprestados.")
-
-    dfi_curr = df_itens()
-    if dfi_curr.empty:
-        st.info("Nenhum item cadastrado manualmente. Adicione abaixo se quiser.")
-
-    with st.form("novo_item"):
-        c1, c2 = st.columns([2,1])
-        with c1:
-            item_nome_in = st.text_input("Nome do item *")
-        with c2:
-            categoria_in = st.selectbox("Categoria", ["Livro", "Jogo", "Outro"], index=0)
-        enviado = st.form_submit_button("Adicionar Item")
-        if enviado and item_nome_in.strip() != "":
-            upsert_item(item_nome_in, categoria_in)
-            st.success("Item adicionado ao catálogo.")
-
-    dfi_novo = df_itens()
-    if not dfi_novo.empty:
-        st.markdown("### Itens cadastrados")
-        st.dataframe(dfi_novo, use_container_width=True, hide_index=True)
-        st.caption("Para remover/editar rapidamente: use um editor SQLite (opcional) ou empreste/devolva normalmente.")
+        # Export catálogo completo (atalho extra)
+        buf2 = BytesIO()
+        with pd.ExcelWriter(buf2, engine="xlsxwriter") as w:
+            dfi_now = df_itens()
+            (dfi_now if not dfi_now.empty else pd.DataFrame([{ "Info": "Catálogo vazio" }])).to_excel(w, sheet_name='catalogo', index=False)
+        buf2.seek(0)
+        st.download_button("⬇️ Baixar catálogo completo", data=buf2.getvalue(), file_name="catalogo_completo.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
