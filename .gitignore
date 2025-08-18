@@ -1,3 +1,5 @@
 .venv/
 sist/
 /sist
+sist_env/
+/sist_env

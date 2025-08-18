@@ -13,7 +13,7 @@
 # - Mantém fluxo de aluno, autocomplete, exportação por período
 #
 # Requisitos:
-#   pip install -r requirements.txt
+#   pip install streamlit pandas xlsxwriter
 #
 # Rodar:
 #   streamlit run app.py
@@ -30,20 +30,20 @@ DB_PATH = Path("sala_leitura.db")
 
 # ---------------- Campos padrão ----------------
 COLS_MOV = [
-    "timestamp","data","hora","tipo",           # Emprestimo, Devolucao, Renovacao (se desejar futuramente)
-    "item_nome","categoria",                      # categoria mantida para compatibilidade
+    "timestamp","data","hora","tipo",           # Emprestimo, Devolucao, Renovacao (futuro)
+    "item_nome","categoria",                    # compatibilidade
     "aluno_nome","aluno_sobrenome","aluno_serie",
     "responsavel","prev_devolucao","observacoes",
     # novos:
-    "quantidade",                                   # int (padrão 1)
-    "beneficiario_tipo",                            # 'aluno' | 'professor' | ''
-    "beneficiario_nome",                            # nome do professor (ou vazio)
+    "quantidade",                                # int (padrão 1)
+    "beneficiario_tipo",                         # 'aluno' | 'professor' | ''
+    "beneficiario_nome",                         # nome do professor (ou vazio)
 ]
 
 COLS_ITENS = [
-    "item_nome","categoria",                      # compatibilidade
+    "item_nome","categoria",                     # compatibilidade
     "titulo","autor","editora","genero","isbn","edicao",
-    "quant_total",                                  # unidades no acervo
+    "quant_total",                               # unidades no acervo
 ]
 
 COLS_ALUNOS = ["nome","sobrenome","serie"]
@@ -53,12 +53,10 @@ COLS_ALUNOS = ["nome","sobrenome","serie"]
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-
 def _table_has_column(con, table, column):
     cur = con.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]  # name is index 1
     return column in cols
-
 
 def init_db():
     with get_conn() as con:
@@ -281,7 +279,7 @@ st.title("📚 Sala de Leitura – Sistema Oficial")
 
 with st.sidebar:
     st.header("Configurações rápidas")
-    resp = st.text_input("Responsável de hoje", value=st.session_state.get("responsavel", ""))
+    resp = st.text_input("Responsável de hoje", value=st.session_state.get("responsavel", ""), key="resp_dia")
     st.session_state["responsavel"] = resp
     st.caption(f"Banco: {DB_PATH.resolve()}")
 
@@ -338,23 +336,19 @@ with abas[0]:
         # escolha de item do catálogo
         if dfi.empty:
             st.warning("Catálogo vazio. Adicione na aba Catálogo.")
-            opcoes = []
-        else:
-            opcoes = dfi.sort_values(["titulo"]).apply(lambda r: f"{r['titulo']} (disp: {int(saldos.loc[saldos['item_nome']==r['item_nome'],'disponivel'].values[0]) if (saldos['item_nome']==r['item_nome']).any() else r['quant_total']})", axis=1).tolist()
-        # map label -> item_nome
         labels = {}
         if not dfi.empty:
             for r in dfi.itertuples(index=False):
                 disp = int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)
                 labels[r.item_nome] = f"{r.titulo or r.item_nome} (disp: {disp})"
         escolha = st.selectbox("Livro", options=list(labels.keys()) if labels else [], format_func=lambda k: labels.get(k, k), index=None)
-        quantidade = st.number_input("Quantidade", min_value=1, value=1)
-        dias = st.number_input("Prazo (dias)", min_value=1, max_value=60, value=7)
+        quantidade = st.number_input("Quantidade", min_value=1, value=1, key="qtd_aluno")
+        dias = st.number_input("Prazo (dias)", min_value=1, max_value=60, value=7, key="prazo_aluno")
         prev_dev = datetime.now() + timedelta(days=int(dias))
         st.caption(f"Prev. devolução: {prev_dev.strftime('%d/%m/%Y')}")
 
         st.markdown("### Aluno")
-        aluno_sel = st.selectbox("Aluno (autocomplete)", alunos_options if alunos_options else [""], index=None, placeholder="Buscar aluno já cadastrado...")
+        aluno_sel = st.selectbox("Aluno (autocomplete)", alunos_options if alunos_options else [""], index=None, placeholder="Buscar aluno já cadastrado...", key="autocomp_aluno")
         nome_pref = sobrenome_pref = serie_pref = ""
         if aluno_sel:
             try:
@@ -364,14 +358,14 @@ with abas[0]:
             except Exception:
                 nome_pref = aluno_sel
         c1,c2,c3 = st.columns(3)
-        with c1: nome = st.text_input("Nome *", value=nome_pref)
-        with c2: sobrenome = st.text_input("Sobrenome *", value=sobrenome_pref)
-        with c3: serie = st.text_input("Série *", value=serie_pref)
-        observ = st.text_input("Observações")
+        with c1: nome = st.text_input("Nome *", value=nome_pref, key="aluno_nome")
+        with c2: sobrenome = st.text_input("Sobrenome *", value=sobrenome_pref, key="aluno_sobrenome")
+        with c3: serie = st.text_input("Série *", value=serie_pref, key="aluno_serie")
+        observ = st.text_input("Observações", key="obs_aluno")
 
     with col2:
         pode = bool(escolha) and nome.strip() and sobrenome.strip() and serie.strip() and quantidade>0
-        if st.button("✅ Registrar Empréstimo", use_container_width=True, disabled=not pode):
+        if st.button("✅ Registrar Empréstimo", use_container_width=True, disabled=not pode, key="btn_emp_aluno"):
             # salva aluno para autocomplete
             if nome.strip() or sobrenome.strip():
                 with get_conn() as con:
@@ -400,24 +394,24 @@ with abas[1]:
     if dfi.empty:
         st.warning("Catálogo vazio. Adicione na aba Catálogo.")
     else:
-        prof = st.text_input("Nome do Professor *")
-        dias_p = st.number_input("Prazo (dias)", min_value=1, max_value=120, value=14)
+        prof = st.text_input("Nome do Professor *", key="prof_nome")
+        dias_p = st.number_input("Prazo (dias)", min_value=1, max_value=120, value=14, key="prazo_prof")
         prev_p = datetime.now() + timedelta(days=int(dias_p))
         st.caption(f"Prev. devolução: {prev_p.strftime('%d/%m/%Y')}")
 
         st.markdown("### Seleção de livros")
         # multiseleção por item_nome
         labels = {r.item_nome: f"{r.titulo or r.item_nome} (disp: {int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)})" for r in dfi.itertuples(index=False)}
-        escolhidos = st.multiselect("Escolha livros", options=list(labels.keys()), format_func=lambda k: labels.get(k,k))
+        escolhidos = st.multiselect("Escolha livros", options=list(labels.keys()), format_func=lambda k: labels.get(k,k), key="multi_prof")
 
         qts = {}
         for k in escolhidos:
             disp = int(saldos.loc[saldos['item_nome']==k,'disponivel'].values[0]) if (saldos['item_nome']==k).any() else int(dfi.loc[dfi['item_nome']==k,'quant_total'].values[0])
             qts[k] = st.number_input(f"Quantidade para {labels[k]}", min_value=1, max_value=max(1, disp if disp>0 else 1), value=min(1, disp) if disp>0 else 1, key=f"q_{k}")
-        observ_p = st.text_input("Observações gerais")
+        observ_p = st.text_input("Observações gerais", key="obs_prof")
 
         pode = prof.strip() and len(escolhidos)>0 and all((qts[k] or 0)>0 for k in escolhidos)
-        if st.button("✅ Registrar Empréstimos do Professor", use_container_width=True, disabled=not pode):
+        if st.button("✅ Registrar Empréstimos do Professor", use_container_width=True, disabled=not pode, key="btn_emp_prof"):
             for k in escolhidos:
                 _base_registro(
                     tipo="Emprestimo",
@@ -442,11 +436,11 @@ with abas[2]:
             st.info("Não há itens emprestados no momento.")
         else:
             labels = {r.item_nome: f"{r.item_nome} – {int(r.emprestado)} emprestado(s)" for r in sal_emprest.itertuples(index=False)}
-            chosen = st.selectbox("Selecione o item", options=list(labels.keys()), format_func=lambda k: labels.get(k,k))
+            chosen = st.selectbox("Selecione o item", options=list(labels.keys()), format_func=lambda k: labels.get(k,k), key="sel_dev_item")
             emprestado_q = int(sal_emprest.loc[sal_emprest['item_nome']==chosen,'emprestado'].values[0])
-            qtd_dev = st.number_input("Quantidade a devolver", min_value=1, max_value=emprestado_q, value=emprestado_q)
-            observ_d = st.text_input("Observações")
-            if st.button("↩️ Registrar Devolução", use_container_width=True):
+            qtd_dev = st.number_input("Quantidade a devolver", min_value=1, max_value=emprestado_q, value=emprestado_q, key="qtd_dev")
+            observ_d = st.text_input("Observações", key="obs_dev")
+            if st.button("↩️ Registrar Devolução", use_container_width=True, key="btn_dev"):
                 _base_registro(
                     tipo="Devolucao",
                     item_nome=chosen,
@@ -464,12 +458,12 @@ with abas[2]:
 
 # ------ Aba: Catálogo ------
 with abas[3]:
-    st.subheader("Catálogo (importar, adicionar, exportar)")
+    st.subheader("Catálogo (importar, adicionar, editar/excluir, exportar)")
 
     colA, colB = st.columns([1,1])
     with colA:
         st.markdown("### Importar Planilha (.xlsx)")
-        up = st.file_uploader("Selecione a planilha do catálogo", type=["xlsx"])
+        up = st.file_uploader("Selecione a planilha do catálogo", type=["xlsx"], key="upload_cat")
         if up is not None:
             try:
                 excel = pd.read_excel(up)
@@ -477,15 +471,15 @@ with abas[3]:
                 st.dataframe(excel.head(10), use_container_width=True, hide_index=True)
                 st.markdown("#### Mapeamento de colunas")
                 cols = ["— ignorar —"] + list(excel.columns)
-                map_titulo   = st.selectbox("Título (Nome do Livro)", cols, index=(cols.index("Nome do Livro") if "Nome do Livro" in cols else 0))
-                map_autor    = st.selectbox("Autor", cols, index=(cols.index("autor") if "autor" in cols else 0))
-                map_editora  = st.selectbox("Editora", cols, index=(cols.index("Editora") if "Editora" in cols else 0))
-                map_genero   = st.selectbox("Gênero", cols, index=(cols.index("genero") if "genero" in cols else 0))
-                map_isbn     = st.selectbox("ISBN", cols, index=(cols.index("isbn") if "isbn" in cols else 0))
-                map_edicao   = st.selectbox("Edição (Número)", cols, index=(cols.index("Número") if "Número" in cols else 0))
-                map_quant    = st.selectbox("Unidades", cols, index=(cols.index("unidades") if "unidades" in cols else 0))
+                map_titulo   = st.selectbox("Título (Nome do Livro)", cols, index=(cols.index("Nome do Livro") if "Nome do Livro" in cols else 0), key="map_titulo")
+                map_autor    = st.selectbox("Autor", cols, index=(cols.index("autor") if "autor" in cols else 0), key="map_autor")
+                map_editora  = st.selectbox("Editora", cols, index=(cols.index("Editora") if "Editora" in cols else 0), key="map_editora")
+                map_genero   = st.selectbox("Gênero", cols, index=(cols.index("genero") if "genero" in cols else 0), key="map_genero")
+                map_isbn     = st.selectbox("ISBN", cols, index=(cols.index("isbn") if "isbn" in cols else 0), key="map_isbn")
+                map_edicao   = st.selectbox("Edição (Número)", cols, index=(cols.index("Número") if "Número" in cols else 0), key="map_edicao")
+                map_quant    = st.selectbox("Unidades", cols, index=(cols.index("unidades") if "unidades" in cols else 0), key="map_quant")
 
-                if st.button("📥 Importar catálogo"):
+                if st.button("📥 Importar catálogo", key="btn_import_cat"):
                     n_ok = 0
                     for _, r in excel.iterrows():
                         def pick(c):
@@ -516,14 +510,14 @@ with abas[3]:
         with st.form("form_add_item"):
             c1,c2 = st.columns([2,1])
             with c1:
-                titulo_in = st.text_input("Título *")
-                autor_in = st.text_input("Autor")
-                editora_in = st.text_input("Editora")
-                genero_in = st.text_input("Gênero")
+                titulo_in = st.text_input("Título *", key="add_titulo")
+                autor_in = st.text_input("Autor", key="add_autor")
+                editora_in = st.text_input("Editora", key="add_editora")
+                genero_in = st.text_input("Gênero", key="add_genero")
             with c2:
-                isbn_in = st.text_input("ISBN")
-                edicao_in = st.text_input("Edição (Número)")
-                quant_in = st.number_input("Unidades", min_value=1, value=1)
+                isbn_in = st.text_input("ISBN", key="add_isbn")
+                edicao_in = st.text_input("Edição (Número)", key="add_edicao")
+                quant_in = st.number_input("Unidades", min_value=1, value=1, key="add_qtd")
             enviado = st.form_submit_button("Adicionar/Atualizar")
             if enviado and titulo_in.strip():
                 upsert_item_catalogo(
@@ -533,18 +527,97 @@ with abas[3]:
                 st.success("Catálogo atualizado.")
 
     st.markdown("---")
+    st.markdown("### Editar / Excluir itens existentes")
+
+    # === Funções auxiliares locais ===
+    def df_itens_full():
+        init_db()
+        with get_conn() as con:
+            return pd.read_sql_query(
+                "SELECT id,item_nome,categoria,titulo,autor,editora,genero,isbn,edicao,quant_total FROM itens",
+                con,
+            )
+
+    def update_item(item_id:int, **fields):
+        if not fields:
+            return
+        init_db()
+        cols = [k for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"] if k in fields]
+        if not cols:
+            return
+        set_clause = ",".join([f"{k}=?" for k in cols])
+        vals = [fields[k] for k in cols] + [item_id]
+        with get_conn() as con:
+            con.execute(f"UPDATE itens SET {set_clause} WHERE id=?", vals)
+            con.commit()
+        df_itens.clear()
+
+    def delete_item(item_id:int):
+        init_db()
+        with get_conn() as con:
+            con.execute("DELETE FROM itens WHERE id=?", (item_id,))
+            con.commit()
+        df_itens.clear()
+
+    dff = df_itens_full()
+    if dff.empty:
+        st.info("Catálogo vazio.")
+    else:
+        # selector por título
+        labels = {int(r.id): f"{r.titulo or r.item_nome} — ISBN: {r.isbn or 's/ISBN'} (Unid: {int(r.quant_total)})" for r in dff.itertuples(index=False)}
+        sel_id = st.selectbox("Escolha um item do catálogo", options=list(labels.keys()), format_func=lambda i: labels.get(int(i), str(i)), key="sel_edit_item")
+        item_row = dff[dff["id"]==int(sel_id)].iloc[0]
+
+        # estoque emprestado para bloqueio de exclusão
+        emprestado_q = 0
+        try:
+            emprestado_q = int(saldos.loc[saldos["item_nome"]==item_row["item_nome"], "emprestado"].values[0])
+        except Exception:
+            emprestado_q = 0
+
+        with st.form("form_edit_item"):
+            c1,c2 = st.columns([2,1])
+            with c1:
+                titulo_e = st.text_input("Título *", value=item_row["titulo"] or "", key="edit_titulo")
+                autor_e = st.text_input("Autor", value=item_row["autor"] or "", key="edit_autor")
+                editora_e = st.text_input("Editora", value=item_row["editora"] or "", key="edit_editora")
+                genero_e = st.text_input("Gênero", value=item_row["genero"] or "", key="edit_genero")
+            with c2:
+                isbn_e = st.text_input("ISBN", value=item_row["isbn"] or "", key="edit_isbn")
+                edicao_e = st.text_input("Edição (Número)", value=item_row["edicao"] or "", key="edit_edicao")
+                quant_e = st.number_input("Unidades", min_value=1, value=int(item_row["quant_total"]) if pd.notna(item_row["quant_total"]) else 1, key="edit_qtd")
+            colbtn1, colbtn2 = st.columns([1,1])
+            salvar = colbtn1.form_submit_button("💾 Salvar alterações")
+            excluir = colbtn2.form_submit_button("🗑️ Excluir item", disabled=(emprestado_q>0))
+
+        if salvar:
+            update_item(int(sel_id),
+                        titulo=titulo_e.strip(), autor=autor_e.strip(), editora=editora_e.strip(), genero=genero_e.strip(),
+                        isbn=isbn_e.strip(), edicao=edicao_e.strip(), quant_total=int(quant_e),
+                        item_nome=(titulo_e.strip() or isbn_e.strip() or autor_e.strip()), categoria="Livro")
+            st.success("Item atualizado.")
+        if excluir:
+            if emprestado_q>0:
+                st.warning("Não é possível excluir: há unidades emprestadas.")
+            else:
+                delete_item(int(sel_id))
+                st.success("Item excluído do catálogo.")
+                st.experimental_rerun()
+
+    st.markdown("---")
     st.caption("Catálogo atual")
     st.dataframe(df_itens(), use_container_width=True, hide_index=True)
 
     # Exportar catálogo
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine=("xlsxwriter" if st.runtime.exists() else "openpyxl")) as w:
-        if dfi.empty:
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        dcurr = df_itens()
+        if dcurr.empty:
             pd.DataFrame([{ "Info": "Catálogo vazio" }]).to_excel(w, sheet_name='catalogo', index=False)
         else:
-            dfi.to_excel(w, sheet_name='catalogo', index=False)
+            dcurr.to_excel(w, sheet_name='catalogo', index=False)
     buf.seek(0)
-    st.download_button("⬇️ Exportar catálogo (.xlsx)", data=buf.getvalue(), file_name="catalogo_sala_leitura.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("⬇️ Exportar catálogo (.xlsx)", data=buf.getvalue(), file_name="catalogo_sala_leitura.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cat")
 
 # ------ Aba: Consulta / Exportar ------
 with abas[4]:
@@ -555,13 +628,13 @@ with abas[4]:
     else:
         colf = st.columns(4)
         with colf[0]:
-            filtro_nome = st.text_input("Nome/Sobrenome contém")
+            filtro_nome = st.text_input("Nome/Sobrenome contém", key="f_nome")
         with colf[1]:
-            filtro_item = st.text_input("Item contém")
+            filtro_item = st.text_input("Item contém", key="f_item")
         with colf[2]:
-            filtro_tipo = st.selectbox("Tipo", ["Todos","Emprestimo","Devolucao"], index=0)
+            filtro_tipo = st.selectbox("Tipo", ["Todos","Emprestimo","Devolucao"], index=0, key="f_tipo")
         with colf[3]:
-            somente_prof = st.checkbox("Somente Professor")
+            somente_prof = st.checkbox("Somente Professor", key="f_prof")
 
         view = dfm_now.copy()
         if filtro_nome:
@@ -583,13 +656,13 @@ with abas[4]:
         hoje = date.today()
         c1,c2,c3 = st.columns([1,1,1])
         with c1:
-            data_ini = st.date_input("Início", value=hoje - timedelta(days=7))
+            data_ini = st.date_input("Início", value=hoje - timedelta(days=7), key="exp_ini")
         with c2:
-            data_fim = st.date_input("Fim", value=hoje)
+            data_fim = st.date_input("Fim", value=hoje, key="exp_fim")
         with c3:
-            incluir_status = st.checkbox("Incluir aba 'status_atual'", value=True)
+            incluir_status = st.checkbox("Incluir aba 'status_atual'", value=True, key="exp_status")
 
-        if st.button("Gerar planilha de movimentações (.xlsx)"):
+        if st.button("Gerar planilha de movimentações (.xlsx)", key="btn_exp_mov"):
             per = view.copy()
             per['ts'] = pd.to_datetime(per['timestamp'], errors='coerce')
             ini = datetime.combine(data_ini, datetime.min.time())
@@ -619,7 +692,7 @@ with abas[4]:
                     sa.to_excel(writer, sheet_name='status_atual', index=False)
             buffer.seek(0)
             nome = f"movimentacoes_{data_ini:%Y%m%d}_{data_fim:%Y%m%d}.xlsx"
-            st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_mov")
 
         # Export catálogo completo (atalho extra)
         buf2 = BytesIO()
@@ -627,4 +700,4 @@ with abas[4]:
             dfi_now = df_itens()
             (dfi_now if not dfi_now.empty else pd.DataFrame([{ "Info": "Catálogo vazio" }])).to_excel(w, sheet_name='catalogo', index=False)
         buf2.seek(0)
-        st.download_button("⬇️ Baixar catálogo completo", data=buf2.getvalue(), file_name="catalogo_completo.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("⬇️ Baixar catálogo completo", data=buf2.getvalue(), file_name="catalogo_completo.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cat_full")
