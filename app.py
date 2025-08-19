@@ -1,19 +1,21 @@
 # ==============================
-# app.py (v3.0 – Catálogo + Empréstimo Professor + Devolução parcial)
+# app.py (v3.1 – Livros + Jogos, edição de categoria)
 # ==============================
 # Sala de Leitura – Empréstimos de Livros e Jogos
 # UI: Streamlit | Banco: SQLite (sala_leitura.db)
 #
-# Novidades v3.0
-# - Aba **Catálogo** com importação de planilha (mapeamento de colunas)
-# - Campos do catálogo: titulo, autor, editora, genero, isbn, edicao (Numero), quant_total (unidades)
-# - **Empréstimo Professor**: multitítulo e multiquantidade
-# - **Devolução parcial** por quantidade
-# - Exportar Catálogo completo e Todos os Empréstimos
-# - Mantém fluxo de aluno, autocomplete, exportação por período
+# Recursos principais:
+# - Aba Catálogo: importar planilha (livros), adicionar manualmente (Livro/Jogo),
+#   editar/excluir, exportar catálogo
+# - Empréstimo Aluno e Professor (prof pode pegar múltiplos títulos/quantidades)
+# - Devolução parcial
+# - Filtros e exportação de movimentações por período
+# - Controle de saldos (disponível/emprestado)
 #
-# Requisitos:
-#   pip install streamlit pandas xlsxwriter
+# Novidades v3.1:
+# - Adição de "Jogo" (nome + quantidade) no catálogo
+# - Rótulo com [categoria] nas seleções de itens
+# - Edição da categoria (Livro ↔ Jogo) no editor de itens
 #
 # Rodar:
 #   streamlit run app.py
@@ -30,20 +32,19 @@ DB_PATH = Path("sala_leitura.db")
 
 # ---------------- Campos padrão ----------------
 COLS_MOV = [
-    "timestamp","data","hora","tipo",           # Emprestimo, Devolucao, Renovacao (futuro)
-    "item_nome","categoria",                    # compatibilidade
+    "timestamp","data","hora","tipo",           # Emprestimo, Devolucao
+    "item_nome","categoria",
     "aluno_nome","aluno_sobrenome","aluno_serie",
     "responsavel","prev_devolucao","observacoes",
-    # novos:
-    "quantidade",                                # int (padrão 1)
-    "beneficiario_tipo",                         # 'aluno' | 'professor' | ''
-    "beneficiario_nome",                         # nome do professor (ou vazio)
+    "quantidade",
+    "beneficiario_tipo",
+    "beneficiario_nome",
 ]
 
 COLS_ITENS = [
-    "item_nome","categoria",                     # compatibilidade
+    "item_nome","categoria",
     "titulo","autor","editora","genero","isbn","edicao",
-    "quant_total",                               # unidades no acervo
+    "quant_total",
 ]
 
 COLS_ALUNOS = ["nome","sobrenome","serie"]
@@ -89,8 +90,8 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS itens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_nome TEXT UNIQUE,      -- rótulo curto/antigo (opcional)
-                categoria TEXT,             -- compatibilidade (p.ex. Livro/Jogo)
+                item_nome TEXT UNIQUE,
+                categoria TEXT,
                 titulo TEXT,
                 autor TEXT,
                 editora TEXT,
@@ -115,7 +116,7 @@ def init_db():
         )
         con.commit()
 
-        # Migrações leves de segurança
+        # Migrações leves
         for col, ddl in [
             ("quantidade", "INTEGER DEFAULT 1"),
             ("beneficiario_tipo", "TEXT DEFAULT ''"),
@@ -144,9 +145,8 @@ def df_mov() -> pd.DataFrame:
         return pd.DataFrame(columns=COLS_MOV)
     for c in COLS_MOV:
         if c not in df.columns:
-            df[c] = "" if c not in ("quantidade",) else 0
-    if "quantidade" in df.columns:
-        df["quantidade"] = pd.to_numeric(df["quantidade"], errors="coerce").fillna(0).astype(int)
+            df[c] = "" if c != "quantidade" else 0
+    df["quantidade"] = pd.to_numeric(df["quantidade"], errors="coerce").fillna(0).astype(int)
     return df[COLS_MOV].copy()
 
 @st.cache_data(ttl=5)
@@ -192,24 +192,38 @@ def inserir_movimento(reg: dict):
     df_mov.clear()
 
 def upsert_item_catalogo(**campos):
-    # chave preferencial: isbn; fallback: titulo+autor+edicao
+    # chave preferencial: isbn; fallback: titulo+autor+edicao; para Jogo usamos item_nome
     init_db()
     with get_conn() as con:
         isbn = (campos.get("isbn") or "").strip()
         titulo = (campos.get("titulo") or "").strip()
         autor = (campos.get("autor") or "").strip()
         edicao = (campos.get("edicao") or "").strip()
-        # tenta localizar
-        if isbn:
-            cur = con.execute("SELECT id FROM itens WHERE isbn=?", (isbn,))
-            row = cur.fetchone()
+        item_nome = (campos.get("item_nome") or "").strip()
+        categoria = (campos.get("categoria") or "Livro").strip()
+
+        row = None
+        if categoria.lower() == "jogo":
+            # Para jogo, usar item_nome como chave
+            if item_nome:
+                cur = con.execute("SELECT id FROM itens WHERE item_nome=?", (item_nome,))
+                row = cur.fetchone()
         else:
-            cur = con.execute("SELECT id FROM itens WHERE (titulo=? AND autor=? AND IFNULL(edicao,'')=?)",
-                              (titulo, autor, edicao))
-            row = cur.fetchone()
+            if isbn:
+                cur = con.execute("SELECT id FROM itens WHERE isbn=?", (isbn,))
+                row = cur.fetchone()
+            else:
+                cur = con.execute(
+                    "SELECT id FROM itens WHERE (titulo=? AND autor=? AND IFNULL(edicao,'')=?)",
+                    (titulo, autor, edicao),
+                )
+                row = cur.fetchone()
+
         campos.setdefault("quant_total", 1)
-        campos.setdefault("categoria", "Livro")
-        campos.setdefault("item_nome", titulo or isbn or autor)
+        campos.setdefault("categoria", categoria or "Livro")
+        if not item_nome:
+            campos["item_nome"] = (titulo or isbn or autor)
+
         if row:
             set_clause = ",".join([f"{k}=?" for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"]])
             params = [campos.get(k) for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"]] + [row[0]]
@@ -230,10 +244,8 @@ def upsert_item_catalogo(**campos):
 def saldo_por_item(dfm: pd.DataFrame) -> pd.DataFrame:
     """Retorna DataFrame com cols: item_nome, titulo, quant_total, emprestado, disponivel"""
     dfi = df_itens()
-    if dfi.empty:
-        base = pd.DataFrame(columns=["item_nome","titulo","quant_total"]).copy()
-    else:
-        base = dfi[["item_nome","titulo","quant_total"]].copy()
+    base = (dfi[["item_nome","titulo","quant_total"]].copy() if not dfi.empty
+            else pd.DataFrame(columns=["item_nome","titulo","quant_total"]))
     if dfm.empty:
         base["emprestado"] = 0
         base["disponivel"] = base["quant_total"]
@@ -248,13 +260,11 @@ def saldo_por_item(dfm: pd.DataFrame) -> pd.DataFrame:
     out["disponivel"] = (out["quant_total"] - out["emprestado"]).clip(lower=0)
     return out
 
-# status para visualização (último evento + saldos)
-
 def status_itens(dfm: pd.DataFrame) -> pd.DataFrame:
     dfi = df_itens()
     sal = saldo_por_item(dfm)
     if dfm.empty:
-        ult = pd.DataFrame(columns=["item_nome","categoria","status","aluno","turma","prev_devolucao"])    
+        ult = pd.DataFrame(columns=["item_nome","categoria","status","aluno","turma","prev_devolucao"])
     else:
         df = dfm.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -264,7 +274,6 @@ def status_itens(dfm: pd.DataFrame) -> pd.DataFrame:
         ult["aluno"] = (ult["aluno_nome"].fillna("") + " " + ult["aluno_sobrenome"].fillna("")).str.strip()
         ult["turma"] = ult["aluno_serie"].fillna("")
         ult = ult[["item_nome","categoria","status","aluno","turma","prev_devolucao"]]
-    # junta saldos e titulo
     if not dfi.empty:
         ult = ult.merge(dfi[["item_nome","titulo"]], on="item_nome", how="right").fillna("")
     else:
@@ -295,15 +304,12 @@ abas = st.tabs([
 dfm = df_mov()
 dfi = df_itens()
 dfa = df_alunos()
-stat = status_itens(dfm)
 saldos = saldo_por_item(dfm)
 
 # Autocomplete de aluno
 alunos_options = []
 if not dfa.empty:
     alunos_options = [f"{r.nome} {r.sobrenome} — {r.serie}".strip() for r in dfa.itertuples(index=False)]
-
-# Helpers de registro
 
 def _base_registro(tipo:str, item_nome:str, categoria:str, quantidade:int, prev_dev:datetime|None, observ:str,
                    aluno_nome:str="", aluno_sobrenome:str="", aluno_serie:str="",
@@ -333,15 +339,14 @@ with abas[0]:
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        # escolha de item do catálogo
-        if dfi.empty:
-            st.warning("Catálogo vazio. Adicione na aba Catálogo.")
+        # labels com categoria
         labels = {}
         if not dfi.empty:
             for r in dfi.itertuples(index=False):
                 disp = int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)
-                labels[r.item_nome] = f"{r.titulo or r.item_nome} (disp: {disp})"
-        escolha = st.selectbox("Livro", options=list(labels.keys()) if labels else [], format_func=lambda k: labels.get(k, k), index=None)
+                nome_visivel = (r.titulo or r.item_nome)
+                labels[r.item_nome] = f"[{r.categoria or 'Livro'}] {nome_visivel} (disp: {disp})"
+        escolha = st.selectbox("Item", options=list(labels.keys()) if labels else [], format_func=lambda k: labels.get(k, k), index=None, key="sel_item_aluno")
         quantidade = st.number_input("Quantidade", min_value=1, value=1, key="qtd_aluno")
         dias = st.number_input("Prazo (dias)", min_value=1, max_value=60, value=7, key="prazo_aluno")
         prev_dev = datetime.now() + timedelta(days=int(dias))
@@ -366,16 +371,18 @@ with abas[0]:
     with col2:
         pode = bool(escolha) and nome.strip() and sobrenome.strip() and serie.strip() and quantidade>0
         if st.button("✅ Registrar Empréstimo", use_container_width=True, disabled=not pode, key="btn_emp_aluno"):
-            # salva aluno para autocomplete
             if nome.strip() or sobrenome.strip():
                 with get_conn() as con:
                     con.execute("INSERT OR IGNORE INTO alunos (nome,sobrenome,serie) VALUES (?,?,?)", (nome.strip(), sobrenome.strip(), serie.strip()))
                     con.commit()
                 df_alunos.clear()
+            # categoria do item selecionado
+            cat_sel = dfi.loc[dfi["item_nome"]==escolha, "categoria"].values
+            categoria_item = (cat_sel[0] if len(cat_sel) else "Livro")
             _base_registro(
                 tipo="Emprestimo",
                 item_nome=escolha,
-                categoria="Livro",
+                categoria=categoria_item,
                 quantidade=quantidade,
                 prev_dev=prev_dev,
                 observ=observ,
@@ -399,24 +406,31 @@ with abas[1]:
         prev_p = datetime.now() + timedelta(days=int(dias_p))
         st.caption(f"Prev. devolução: {prev_p.strftime('%d/%m/%Y')}")
 
-        st.markdown("### Seleção de livros")
-        # multiseleção por item_nome
-        labels = {r.item_nome: f"{r.titulo or r.item_nome} (disp: {int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)})" for r in dfi.itertuples(index=False)}
-        escolhidos = st.multiselect("Escolha livros", options=list(labels.keys()), format_func=lambda k: labels.get(k,k), key="multi_prof")
+        st.markdown("### Seleção de itens")
+        labels = {
+            r.item_nome: f"[{r.categoria or 'Livro'}] {r.titulo or r.item_nome} "
+                         f"(disp: {int(saldos.loc[saldos['item_nome']==r.item_nome,'disponivel'].values[0]) if (saldos['item_nome']==r.item_nome).any() else int(r.quant_total)})"
+            for r in dfi.itertuples(index=False)
+        }
+        escolhidos = st.multiselect("Escolha itens", options=list(labels.keys()), format_func=lambda k: labels.get(k,k), key="multi_prof")
 
         qts = {}
         for k in escolhidos:
-            disp = int(saldos.loc[saldos['item_nome']==k,'disponivel'].values[0]) if (saldos['item_nome']==k).any() else int(dfi.loc[dfi['item_nome']==k,'quant_total'].values[0])
-            qts[k] = st.number_input(f"Quantidade para {labels[k]}", min_value=1, max_value=max(1, disp if disp>0 else 1), value=min(1, disp) if disp>0 else 1, key=f"q_{k}")
+            disp = int(saldos.loc[saldos['item_nome']==k,'disponivel'].values[0]) if (saldos['item_nome']==k).any() \
+                   else int(dfi.loc[dfi['item_nome']==k,'quant_total'].values[0])
+            qts[k] = st.number_input(f"Quantidade para {labels[k]}", min_value=1, max_value=max(1, disp if disp>0 else 1),
+                                     value=min(1, disp) if disp>0 else 1, key=f"q_{k}")
         observ_p = st.text_input("Observações gerais", key="obs_prof")
 
         pode = prof.strip() and len(escolhidos)>0 and all((qts[k] or 0)>0 for k in escolhidos)
         if st.button("✅ Registrar Empréstimos do Professor", use_container_width=True, disabled=not pode, key="btn_emp_prof"):
             for k in escolhidos:
+                cat_sel = dfi.loc[dfi["item_nome"]==k, "categoria"].values
+                categoria_item = (cat_sel[0] if len(cat_sel) else "Livro")
                 _base_registro(
                     tipo="Emprestimo",
                     item_nome=k,
-                    categoria="Livro",
+                    categoria=categoria_item,
                     quantidade=int(qts[k]),
                     prev_dev=prev_p,
                     observ=observ_p,
@@ -430,7 +444,6 @@ with abas[2]:
     if dfi.empty:
         st.info("Catálogo vazio.")
     else:
-        # Mostra itens com emprestado>0
         sal_emprest = saldos[saldos["emprestado"]>0].copy()
         if sal_emprest.empty:
             st.info("Não há itens emprestados no momento.")
@@ -444,7 +457,7 @@ with abas[2]:
                 _base_registro(
                     tipo="Devolucao",
                     item_nome=chosen,
-                    categoria="Livro",
+                    categoria="",
                     quantidade=int(qtd_dev),
                     prev_dev=None,
                     observ=observ_d,
@@ -462,7 +475,7 @@ with abas[3]:
 
     colA, colB = st.columns([1,1])
     with colA:
-        st.markdown("### Importar Planilha (.xlsx)")
+        st.markdown("### Importar Planilha de Livros (.xlsx)")
         up = st.file_uploader("Selecione a planilha do catálogo", type=["xlsx"], key="upload_cat")
         if up is not None:
             try:
@@ -479,7 +492,7 @@ with abas[3]:
                 map_edicao   = st.selectbox("Edição (Número)", cols, index=(cols.index("Número") if "Número" in cols else 0), key="map_edicao")
                 map_quant    = st.selectbox("Unidades", cols, index=(cols.index("unidades") if "unidades" in cols else 0), key="map_quant")
 
-                if st.button("📥 Importar catálogo", key="btn_import_cat"):
+                if st.button("📥 Importar catálogo (Livros)", key="btn_import_cat"):
                     n_ok = 0
                     for _, r in excel.iterrows():
                         def pick(c):
@@ -499,37 +512,55 @@ with abas[3]:
                             qt_i = 1
                         campos["quant_total"] = max(1, qt_i)
                         campos["item_nome"] = campos["titulo"] or campos["isbn"] or campos["autor"]
+                        campos["categoria"] = "Livro"
                         upsert_item_catalogo(**campos)
                         n_ok += 1
-                    st.success(f"Importação concluída: {n_ok} registro(s).")
+                    st.success(f"Importação concluída: {n_ok} livro(s).")
             except Exception as e:
                 st.error(f"Falha ao ler Excel: {e}")
 
     with colB:
         st.markdown("### Adicionar Manualmente")
         with st.form("form_add_item"):
-            c1,c2 = st.columns([2,1])
-            with c1:
-                titulo_in = st.text_input("Título *", key="add_titulo")
-                autor_in = st.text_input("Autor", key="add_autor")
-                editora_in = st.text_input("Editora", key="add_editora")
-                genero_in = st.text_input("Gênero", key="add_genero")
-            with c2:
-                isbn_in = st.text_input("ISBN", key="add_isbn")
-                edicao_in = st.text_input("Edição (Número)", key="add_edicao")
-                quant_in = st.number_input("Unidades", min_value=1, value=1, key="add_qtd")
+            tipo_item = st.radio("Tipo de item", ["Livro", "Jogo"], horizontal=True, key="tipo_item_add")
+
+            if tipo_item == "Livro":
+                c1,c2 = st.columns([2,1])
+                with c1:
+                    titulo_in = st.text_input("Título *", key="add_titulo")
+                    autor_in = st.text_input("Autor", key="add_autor")
+                    editora_in = st.text_input("Editora", key="add_editora")
+                    genero_in = st.text_input("Gênero", key="add_genero")
+                with c2:
+                    isbn_in = st.text_input("ISBN", key="add_isbn")
+                    edicao_in = st.text_input("Edição (Número)", key="add_edicao")
+                    quant_in = st.number_input("Unidades", min_value=1, value=1, key="add_qtd")
+            else:
+                nome_jogo = st.text_input("Nome do Jogo *", key="add_jogo_nome")
+                quant_in = st.number_input("Unidades", min_value=1, value=1, key="add_jogo_qtd")
+
             enviado = st.form_submit_button("Adicionar/Atualizar")
-            if enviado and titulo_in.strip():
-                upsert_item_catalogo(
-                    titulo=titulo_in.strip(), autor=autor_in.strip(), editora=editora_in.strip(), genero=genero_in.strip(),
-                    isbn=isbn_in.strip(), edicao=edicao_in.strip(), quant_total=int(quant_in), item_nome=titulo_in.strip(), categoria="Livro"
-                )
-                st.success("Catálogo atualizado.")
+            if enviado:
+                if tipo_item == "Livro" and titulo_in.strip():
+                    upsert_item_catalogo(
+                        titulo=titulo_in.strip(), autor=autor_in.strip(), editora=editora_in.strip(), genero=genero_in.strip(),
+                        isbn=isbn_in.strip(), edicao=edicao_in.strip(), quant_total=int(quant_in),
+                        item_nome=titulo_in.strip(), categoria="Livro"
+                    )
+                    st.success("Livro adicionado/atualizado no catálogo.")
+                elif tipo_item == "Jogo" and nome_jogo.strip():
+                    upsert_item_catalogo(
+                        titulo="", autor="", editora="", genero="", isbn="", edicao="",
+                        quant_total=int(quant_in), item_nome=nome_jogo.strip(), categoria="Jogo"
+                    )
+                    st.success("Jogo adicionado/atualizado no catálogo.")
+                else:
+                    st.warning("Preencha os campos obrigatórios.")
 
     st.markdown("---")
     st.markdown("### Editar / Excluir itens existentes")
 
-    # === Funções auxiliares locais ===
+    # Auxiliares locais
     def df_itens_full():
         init_db()
         with get_conn() as con:
@@ -563,17 +594,19 @@ with abas[3]:
     if dff.empty:
         st.info("Catálogo vazio.")
     else:
-        # selector por título
-        labels = {int(r.id): f"{r.titulo or r.item_nome} — ISBN: {r.isbn or 's/ISBN'} (Unid: {int(r.quant_total)})" for r in dff.itertuples(index=False)}
-        sel_id = st.selectbox("Escolha um item do catálogo", options=list(labels.keys()), format_func=lambda i: labels.get(int(i), str(i)), key="sel_edit_item")
+        labels = {
+            int(r.id): f"[{r.categoria or 'Livro'}] {r.titulo or r.item_nome} — ISBN: {r.isbn or 's/ISBN'} (Unid: {int(r.quant_total)})"
+            for r in dff.itertuples(index=False)
+        }
+        sel_id = st.selectbox("Escolha um item do catálogo", options=list(labels.keys()),
+                              format_func=lambda i: labels.get(int(i), str(i)), key="sel_edit_item")
         item_row = dff[dff["id"]==int(sel_id)].iloc[0]
 
         # estoque emprestado para bloqueio de exclusão
-        emprestado_q = 0
         try:
-            emprestado_q = int(saldos.loc[saldos["item_nome"]==item_row["item_nome"], "emprestado"].values[0])
+            emp_q = int(saldos.loc[saldos["item_nome"]==item_row["item_nome"], "emprestado"].values[0])
         except Exception:
-            emprestado_q = 0
+            emp_q = 0
 
         with st.form("form_edit_item"):
             c1,c2 = st.columns([2,1])
@@ -585,19 +618,30 @@ with abas[3]:
             with c2:
                 isbn_e = st.text_input("ISBN", value=item_row["isbn"] or "", key="edit_isbn")
                 edicao_e = st.text_input("Edição (Número)", value=item_row["edicao"] or "", key="edit_edicao")
-                quant_e = st.number_input("Unidades", min_value=1, value=int(item_row["quant_total"]) if pd.notna(item_row["quant_total"]) else 1, key="edit_qtd")
+                quant_e = st.number_input("Unidades", min_value=1,
+                                          value=int(item_row["quant_total"]) if pd.notna(item_row["quant_total"]) else 1,
+                                          key="edit_qtd")
+                categoria_e = st.selectbox("Categoria", ["Livro","Jogo"],
+                                           index=(0 if (item_row["categoria"] or "Livro")=="Livro" else 1),
+                                           key="edit_categoria")
             colbtn1, colbtn2 = st.columns([1,1])
             salvar = colbtn1.form_submit_button("💾 Salvar alterações")
-            excluir = colbtn2.form_submit_button("🗑️ Excluir item", disabled=(emprestado_q>0))
+            excluir = colbtn2.form_submit_button("🗑️ Excluir item", disabled=(emp_q>0))
 
         if salvar:
-            update_item(int(sel_id),
-                        titulo=titulo_e.strip(), autor=autor_e.strip(), editora=editora_e.strip(), genero=genero_e.strip(),
-                        isbn=isbn_e.strip(), edicao=edicao_e.strip(), quant_total=int(quant_e),
-                        item_nome=(titulo_e.strip() or isbn_e.strip() or autor_e.strip()), categoria="Livro")
+            # Para Jogo, permitir título vazio e usar item_nome como nome principal
+            item_nome_new = (titulo_e.strip() or isbn_e.strip() or autor_e.strip())
+            if categoria_e == "Jogo" and not item_nome_new:
+                item_nome_new = item_row["item_nome"]  # fallback
+            update_item(
+                int(sel_id),
+                titulo=titulo_e.strip(), autor=autor_e.strip(), editora=editora_e.strip(),
+                genero=genero_e.strip(), isbn=isbn_e.strip(), edicao=edicao_e.strip(),
+                quant_total=int(quant_e), item_nome=item_nome_new, categoria=categoria_e,
+            )
             st.success("Item atualizado.")
         if excluir:
-            if emprestado_q>0:
+            if emp_q>0:
                 st.warning("Não é possível excluir: há unidades emprestadas.")
             else:
                 delete_item(int(sel_id))
@@ -608,16 +652,26 @@ with abas[3]:
     st.caption("Catálogo atual")
     st.dataframe(df_itens(), use_container_width=True, hide_index=True)
 
-    # Exportar catálogo
+    # Exportar catálogo (inclui livros e jogos — você não precisa exportar jogos separadamente)
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        dcurr = df_itens()
-        if dcurr.empty:
-            pd.DataFrame([{ "Info": "Catálogo vazio" }]).to_excel(w, sheet_name='catalogo', index=False)
-        else:
-            dcurr.to_excel(w, sheet_name='catalogo', index=False)
+    try:
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            dcurr = df_itens()
+            if dcurr.empty:
+                pd.DataFrame([{ "Info": "Catálogo vazio" }]).to_excel(w, sheet_name='catalogo', index=False)
+            else:
+                dcurr.to_excel(w, sheet_name='catalogo', index=False)
+    except Exception:
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            dcurr = df_itens()
+            if dcurr.empty:
+                pd.DataFrame([{ "Info": "Catálogo vazio" }]).to_excel(w, sheet_name='catalogo', index=False)
+            else:
+                dcurr.to_excel(w, sheet_name='catalogo', index=False)
     buf.seek(0)
-    st.download_button("⬇️ Exportar catálogo (.xlsx)", data=buf.getvalue(), file_name="catalogo_sala_leitura.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cat")
+    st.download_button("⬇️ Exportar catálogo (.xlsx)", data=buf.getvalue(),
+                       file_name="catalogo_sala_leitura.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cat")
 
 # ------ Aba: Consulta / Exportar ------
 with abas[4]:
@@ -677,27 +731,29 @@ with abas[4]:
             ]
             per_export = per[[c for _,c in cols_novas]].rename(columns=dict(cols_novas)) if not per.empty else pd.DataFrame(columns=[k for k,_ in cols_novas])
             buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                try:
+            try:
+                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                     order_cols = [c for c in ['Data','Hora'] if c in per_export.columns]
                     per_sorted = per_export.sort_values(order_cols, ascending=True) if order_cols else per_export
-                except Exception:
-                    per_sorted = per_export
-                if per_sorted.empty:
-                    pd.DataFrame([{ "Info": f"Sem registros entre {data_ini:%d/%m/%Y} e {data_fim:%d/%m/%Y}" }]).to_excel(writer, sheet_name='emprestimos', index=False)
-                else:
-                    per_sorted.to_excel(writer, sheet_name='emprestimos', index=False)
-                if incluir_status:
-                    sa = status_itens(df_mov())
-                    sa.to_excel(writer, sheet_name='status_atual', index=False)
+                    if per_sorted.empty:
+                        pd.DataFrame([{ "Info": f"Sem registros entre {data_ini:%d/%m/%Y} e {data_fim:%d/%m/%Y}" }]).to_excel(writer, sheet_name='emprestimos', index=False)
+                    else:
+                        per_sorted.to_excel(writer, sheet_name='emprestimos', index=False)
+                    if incluir_status:
+                        sa = status_itens(df_mov())
+                        sa.to_excel(writer, sheet_name='status_atual', index=False)
+            except Exception:
+                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                    order_cols = [c for c in ['Data','Hora'] if c in per_export.columns]
+                    per_sorted = per_export.sort_values(order_cols, ascending=True) if order_cols else per_export
+                    if per_sorted.empty:
+                        pd.DataFrame([{ "Info": f"Sem registros entre {data_ini:%d/%m/%Y} e {data_fim:%d/%m/%Y}" }]).to_excel(writer, sheet_name='emprestimos', index=False)
+                    else:
+                        per_sorted.to_excel(writer, sheet_name='emprestimos', index=False)
+                    if incluir_status:
+                        sa = status_itens(df_mov())
+                        sa.to_excel(writer, sheet_name='status_atual', index=False)
             buffer.seek(0)
             nome = f"movimentacoes_{data_ini:%Y%m%d}_{data_fim:%Y%m%d}.xlsx"
-            st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_mov")
-
-        # Export catálogo completo (atalho extra)
-        buf2 = BytesIO()
-        with pd.ExcelWriter(buf2, engine="xlsxwriter") as w:
-            dfi_now = df_itens()
-            (dfi_now if not dfi_now.empty else pd.DataFrame([{ "Info": "Catálogo vazio" }])).to_excel(w, sheet_name='catalogo', index=False)
-        buf2.seek(0)
-        st.download_button("⬇️ Baixar catálogo completo", data=buf2.getvalue(), file_name="catalogo_completo.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cat_full")
+            st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_mov")
