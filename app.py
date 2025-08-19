@@ -1,24 +1,8 @@
 # ==============================
-# app.py (v3.1 – Livros + Jogos, edição de categoria)
+# app.py (v3.2 – Devolução por empréstimo individual + pendentes)
 # ==============================
 # Sala de Leitura – Empréstimos de Livros e Jogos
 # UI: Streamlit | Banco: SQLite (sala_leitura.db)
-#
-# Recursos principais:
-# - Aba Catálogo: importar planilha (livros), adicionar manualmente (Livro/Jogo),
-#   editar/excluir, exportar catálogo
-# - Empréstimo Aluno e Professor (prof pode pegar múltiplos títulos/quantidades)
-# - Devolução parcial
-# - Filtros e exportação de movimentações por período
-# - Controle de saldos (disponível/emprestado)
-#
-# Novidades v3.1:
-# - Adição de "Jogo" (nome + quantidade) no catálogo
-# - Rótulo com [categoria] nas seleções de itens
-# - Edição da categoria (Livro ↔ Jogo) no editor de itens
-#
-# Rodar:
-#   streamlit run app.py
 
 from __future__ import annotations
 import streamlit as st
@@ -39,6 +23,7 @@ COLS_MOV = [
     "quantidade",
     "beneficiario_tipo",
     "beneficiario_nome",
+    "loan_id",                                  # <- NOVO: id do empréstimo original
 ]
 
 COLS_ITENS = [
@@ -81,7 +66,8 @@ def init_db():
                 observacoes TEXT,
                 quantidade INTEGER DEFAULT 1,
                 beneficiario_tipo TEXT DEFAULT '',
-                beneficiario_nome TEXT DEFAULT ''
+                beneficiario_nome TEXT DEFAULT '',
+                loan_id INTEGER
             );
             """
         )
@@ -116,11 +102,12 @@ def init_db():
         )
         con.commit()
 
-        # Migrações leves
+        # Migrações leves (garantia de colunas)
         for col, ddl in [
             ("quantidade", "INTEGER DEFAULT 1"),
             ("beneficiario_tipo", "TEXT DEFAULT ''"),
             ("beneficiario_nome", "TEXT DEFAULT ''"),
+            ("loan_id", "INTEGER"),
         ]:
             if not _table_has_column(con, "movimentacoes", col):
                 con.execute(f"ALTER TABLE movimentacoes ADD COLUMN {col} {ddl}")
@@ -132,26 +119,140 @@ def init_db():
                 con.execute(f"ALTER TABLE itens ADD COLUMN {col} {ddl}")
         con.commit()
 
+def _benef_key(row: pd.Series) -> tuple:
+    """Chave do beneficiário para casar devoluções antigas com empréstimos."""
+    bt = (row.get("beneficiario_tipo") or "").strip().lower()
+    if bt == "professor":
+        return ("professor", (row.get("beneficiario_nome") or "").strip())
+    # aluno
+    return ("aluno",
+            (row.get("aluno_nome") or "").strip(),
+            (row.get("aluno_sobrenome") or "").strip(),
+            (row.get("aluno_serie") or "").strip())
+
+def migrate_link_old_returns():
+    """Vincula loan_id dos empréstimos e tenta associar devoluções antigas (sem loan_id) ao(s) empréstimo(s) corretos (FIFO)."""
+    with get_conn() as con:
+        con.row_factory = sqlite3.Row
+
+        # 1) loan_id = id para todas as linhas de tipo Emprestimo sem loan_id
+        con.execute("""
+            UPDATE movimentacoes
+               SET loan_id = id
+             WHERE (loan_id IS NULL OR loan_id = 0)
+               AND lower(tipo) LIKE 'emprest%';
+        """)
+
+        # 2) Carrega empréstimos ordenados por tempo
+        df_emp = pd.read_sql_query("""
+            SELECT id, item_nome, quantidade, beneficiario_tipo, beneficiario_nome,
+                   aluno_nome, aluno_sobrenome, aluno_serie, timestamp
+              FROM movimentacoes
+             WHERE lower(tipo) LIKE 'emprest%'
+             ORDER BY datetime(timestamp)
+        """, con)
+        if df_emp.empty:
+            return
+
+        # saldo disponível por empréstimo (inicialmente a própria quantidade menos devoluções já vinculadas)
+        df_devs_linked = pd.read_sql_query("""
+            SELECT loan_id, SUM(quantidade) as q
+              FROM movimentacoes
+             WHERE lower(tipo) LIKE 'devolu%' AND loan_id IS NOT NULL
+             GROUP BY loan_id
+        """, con)
+        linked_map = {int(r["loan_id"]): int(r["q"]) for _, r in df_devs_linked.iterrows()} if not df_devs_linked.empty else {}
+
+        # constrói estrutura FIFO por (item, beneficiario)
+        fifo = {}  # key -> list of dicts {id, disponivel}
+        for _, e in df_emp.iterrows():
+            key = ( (e["item_nome"] or "").strip(), _benef_key(e) )
+            disponivel = int(e["quantidade"] or 0) - int(linked_map.get(int(e["id"]), 0))
+            if disponivel <= 0:
+                continue
+            fifo.setdefault(key, []).append({"id": int(e["id"]), "disponivel": disponivel})
+
+        # 3) Processa devoluções SEM loan_id
+        df_dev = pd.read_sql_query("""
+            SELECT id, item_nome, quantidade, beneficiario_tipo, beneficiario_nome,
+                   aluno_nome, aluno_sobrenome, aluno_serie, timestamp, data, hora,
+                   responsavel, prev_devolucao, observacoes, categoria
+              FROM movimentacoes
+             WHERE lower(tipo) LIKE 'devolu%'
+               AND (loan_id IS NULL OR loan_id = 0)
+             ORDER BY datetime(timestamp)
+        """, con)
+
+        for _, d in df_dev.iterrows():
+            key = ( (d["item_nome"] or "").strip(), _benef_key(d) )
+            fila = fifo.get(key, [])
+            if not fila:
+                # Não achou empréstimo correspondente — mantém sem loan_id
+                continue
+            restante = int(d["quantidade"] or 0)
+            # vamos fatiar se necessário: criar novas devoluções coladas com loan_id
+            for bucket in fila:
+                if restante <= 0:
+                    break
+                if bucket["disponivel"] <= 0:
+                    continue
+                aloca = min(restante, bucket["disponivel"])
+                # cria nova linha de devolução vinculada
+                con.execute("""
+                    INSERT INTO movimentacoes (
+                        timestamp, data, hora, tipo, item_nome, categoria,
+                        aluno_nome, aluno_sobrenome, aluno_serie, responsavel,
+                        prev_devolucao, observacoes, quantidade,
+                        beneficiario_tipo, beneficiario_nome, loan_id
+                    ) VALUES (?, ?, ?, 'Devolucao', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d["timestamp"], d["data"], d["hora"], d["item_nome"], d["categoria"],
+                    d["aluno_nome"], d["aluno_sobrenome"], d["aluno_serie"], d["responsavel"],
+                    d["prev_devolucao"], d["observacoes"], int(aloca),
+                    d["beneficiario_tipo"], d["beneficiario_nome"], int(bucket["id"])
+                ))
+                bucket["disponivel"] -= aloca
+                restante -= aloca
+
+            if restante <= 0:
+                # Remove a devolução antiga original (não vinculada)
+                con.execute("DELETE FROM movimentacoes WHERE id = ?", (int(d["id"]),))
+            else:
+                # Atualiza a devolução original com o que sobrou (sem loan_id mesmo)
+                con.execute("UPDATE movimentacoes SET quantidade=? WHERE id=?", (int(restante), int(d["id"])))
+
+        con.commit()
+
+def ensure_migrations():
+    init_db()
+    migrate_link_old_returns()
+
 @st.cache_data(ttl=5)
 def df_mov() -> pd.DataFrame:
-    init_db()
+    ensure_migrations()
     with get_conn() as con:
         df = pd.read_sql_query(
             "SELECT timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,"
-            "responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome FROM movimentacoes",
+            "responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome,loan_id "
+            "FROM movimentacoes",
             con,
         )
     if df.empty:
         return pd.DataFrame(columns=COLS_MOV)
+    # coerção
+    if "quantidade" in df.columns:
+        df["quantidade"] = pd.to_numeric(df["quantidade"], errors="coerce").fillna(0).astype(int)
+    if "loan_id" in df.columns:
+        df["loan_id"] = pd.to_numeric(df["loan_id"], errors="coerce").fillna(0).astype(int)
+    # preenche colunas faltantes
     for c in COLS_MOV:
         if c not in df.columns:
-            df[c] = "" if c != "quantidade" else 0
-    df["quantidade"] = pd.to_numeric(df["quantidade"], errors="coerce").fillna(0).astype(int)
+            df[c] = "" if c not in ("quantidade","loan_id") else 0
     return df[COLS_MOV].copy()
 
 @st.cache_data(ttl=5)
 def df_itens() -> pd.DataFrame:
-    init_db()
+    ensure_migrations()
     with get_conn() as con:
         df = pd.read_sql_query(
             "SELECT item_nome,categoria,titulo,autor,editora,genero,isbn,edicao,quant_total FROM itens",
@@ -164,7 +265,7 @@ def df_itens() -> pd.DataFrame:
 
 @st.cache_data(ttl=5)
 def df_alunos() -> pd.DataFrame:
-    init_db()
+    ensure_migrations()
     with get_conn() as con:
         df = pd.read_sql_query("SELECT nome,sobrenome,serie FROM alunos", con)
     if df.empty:
@@ -173,27 +274,38 @@ def df_alunos() -> pd.DataFrame:
 
 # CRUD helpers
 
-def inserir_movimento(reg: dict):
-    init_db()
-    reg2 = {**{c: (0 if c=="quantidade" else "") for c in COLS_MOV}, **reg}
+def inserir_movimento(reg: dict) -> int:
+    """Insere movimento. Se for Emprestimo sem loan_id, atribui loan_id=id do próprio registro.
+       Retorna o id do movimento inserido."""
+    ensure_migrations()
+    # valores padrão
+    base = {c: (0 if c in ("quantidade","loan_id") else "") for c in COLS_MOV}
+    reg2 = {**base, **reg}
     if not reg2.get("quantidade"):
         reg2["quantidade"] = 1
     with get_conn() as con:
-        con.execute(
+        cur = con.cursor()
+        cur.execute(
             """
             INSERT INTO movimentacoes (
                 timestamp,data,hora,tipo,item_nome,categoria,aluno_nome,aluno_sobrenome,aluno_serie,
-                responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                responsavel,prev_devolucao,observacoes,quantidade,beneficiario_tipo,beneficiario_nome,loan_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [reg2.get(c, "") for c in COLS_MOV],
         )
+        mid = cur.lastrowid
+        # Se for empréstimo e loan_id não veio, marca loan_id = id
+        if str(reg2.get("tipo","")).lower().startswith("emprest") and (not reg2.get("loan_id")):
+            cur.execute("UPDATE movimentacoes SET loan_id = ? WHERE id = ?", (int(mid), int(mid)))
         con.commit()
-    df_mov.clear()
+    # limpa caches
+    df_mov.clear(); df_itens.clear()
+    return int(mid)
 
 def upsert_item_catalogo(**campos):
-    # chave preferencial: isbn; fallback: titulo+autor+edicao; para Jogo usamos item_nome
-    init_db()
+    # chave preferencial: isbn; fallback: titulo+autor+edicao; para Jogo: item_nome
+    ensure_migrations()
     with get_conn() as con:
         isbn = (campos.get("isbn") or "").strip()
         titulo = (campos.get("titulo") or "").strip()
@@ -204,7 +316,6 @@ def upsert_item_catalogo(**campos):
 
         row = None
         if categoria.lower() == "jogo":
-            # Para jogo, usar item_nome como chave
             if item_nome:
                 cur = con.execute("SELECT id FROM itens WHERE item_nome=?", (item_nome,))
                 row = cur.fetchone()
@@ -239,21 +350,19 @@ def upsert_item_catalogo(**campos):
         con.commit()
     df_itens.clear()
 
-# ---------------- Disponibilidade / saldos ----------------
+# ---------------- Regras de saldo e status ----------------
 
 def saldo_por_item(dfm: pd.DataFrame) -> pd.DataFrame:
-    """Retorna DataFrame com cols: item_nome, titulo, quant_total, emprestado, disponivel"""
     dfi = df_itens()
-    base = (dfi[["item_nome","titulo","quant_total"]].copy() if not dfi.empty
-            else pd.DataFrame(columns=["item_nome","titulo","quant_total"]))
+    base = (dfi[["item_nome","titulo","quant_total"]].copy()
+            if not dfi.empty else pd.DataFrame(columns=["item_nome","titulo","quant_total"]))
     if dfm.empty:
         base["emprestado"] = 0
         base["disponivel"] = base["quant_total"]
         return base
     mov = dfm.copy()
-    mov["quantidade"] = pd.to_numeric(mov["quantidade"], errors="coerce").fillna(0).astype(int)
     mov["sinal"] = mov["tipo"].str.lower().map(lambda t: 1 if t.startswith("emprest") else (-1 if t.startswith("devolu") else 0))
-    mov["delta"] = mov["quantidade"] * mov["sinal"]
+    mov["delta"] = mov["quantidade"].astype(int) * mov["sinal"]
     agg = mov.groupby("item_nome")["delta"].sum().rename("emprestado").reset_index()
     out = base.merge(agg, on="item_nome", how="left").fillna({"emprestado":0})
     out["emprestado"] = out["emprestado"].astype(int).clip(lower=0)
@@ -278,8 +387,60 @@ def status_itens(dfm: pd.DataFrame) -> pd.DataFrame:
         ult = ult.merge(dfi[["item_nome","titulo"]], on="item_nome", how="right").fillna("")
     else:
         ult["titulo"] = ult["item_nome"]
-    ult = ult.merge(sal[["item_nome","quant_total","emprestado","disponivel"]], on="item_nome", how="left").fillna({"quant_total":0,"emprestado":0,"disponivel":0})
+    ult = ult.merge(sal[["item_nome","quant_total","emprestado","disponivel"]],
+                    on="item_nome", how="left").fillna({"quant_total":0,"emprestado":0,"disponivel":0})
     return ult
+
+# ---------------- Empréstimos pendentes (por loan) ----------------
+
+def emprestimos_pendentes_df() -> pd.DataFrame:
+    """Retorna cada empréstimo com saldo pendente (>0), incluindo aluno/professor."""
+    dfm = df_mov()
+    if dfm.empty:
+        return pd.DataFrame(columns=[
+            "loan_id","item_nome","categoria","titulo","data","hora","prev_devolucao",
+            "beneficiario_tipo","beneficiario_nome","aluno_nome","aluno_sobrenome","aluno_serie",
+            "q_emprestado","q_devolvido","q_pendente","atrasado"
+        ])
+    # base: todos empréstimos (com loan_id == id, garantido pela migração)
+    emp = dfm[dfm["tipo"].str.lower().str.startswith("emprest")].copy()
+    if emp.empty:
+        return pd.DataFrame(columns=[
+            "loan_id","item_nome","categoria","titulo","data","hora","prev_devolucao",
+            "beneficiario_tipo","beneficiario_nome","aluno_nome","aluno_sobrenome","aluno_serie",
+            "q_emprestado","q_devolvido","q_pendente","atrasado"
+        ])
+
+    # devoluções por loan_id
+    dev = dfm[dfm["tipo"].str.lower().str.startswith("devolu") & (dfm["loan_id"]>0)][["loan_id","quantidade"]].groupby("loan_id").sum()
+    emp["q_devolvido"] = emp["loan_id"].map(dev["quantidade"]) if not dev.empty else 0
+    emp["q_devolvido"] = emp["q_devolvido"].fillna(0).astype(int)
+    emp["q_emprestado"] = emp["quantidade"].astype(int)
+    emp["q_pendente"] = (emp["q_emprestado"] - emp["q_devolvido"]).clip(lower=0).astype(int)
+
+    # junta título
+    dfi = df_itens()
+    if not dfi.empty:
+        emp = emp.merge(dfi[["item_nome","titulo"]], on="item_nome", how="left")
+    else:
+        emp["titulo"] = emp["item_nome"]
+
+    # atraso
+    def _is_late(s):
+        try:
+            if not s: return False
+            d = datetime.strptime(s, "%d/%m/%Y").date()
+            return d < date.today()
+        except Exception:
+            return False
+    emp["atrasado"] = emp["prev_devolucao"].apply(_is_late)
+
+    # apenas pendentes
+    cols = ["loan_id","item_nome","categoria","titulo","data","hora","prev_devolucao",
+            "beneficiario_tipo","beneficiario_nome","aluno_nome","aluno_sobrenome","aluno_serie",
+            "q_emprestado","q_devolvido","q_pendente","atrasado"]
+    out = emp.loc[emp["q_pendente"]>0, cols].sort_values(["atrasado","prev_devolucao","data","hora"], ascending=[False, True, True, True])
+    return out.reset_index(drop=True)
 
 # ---------------- UI ----------------
 
@@ -295,7 +456,7 @@ with st.sidebar:
 abas = st.tabs([
     "➕ Empréstimo Aluno",
     "👩‍🏫 Empréstimo Professor",
-    "↩️ Devolução (parcial)",
+    "↩️ Devolução (por empréstimo)",
     "📚 Catálogo",
     "🔎 Consulta / Exportar",
 ])
@@ -313,9 +474,9 @@ if not dfa.empty:
 
 def _base_registro(tipo:str, item_nome:str, categoria:str, quantidade:int, prev_dev:datetime|None, observ:str,
                    aluno_nome:str="", aluno_sobrenome:str="", aluno_serie:str="",
-                   beneficiario_tipo:str="aluno", beneficiario_nome:str=""):
+                   beneficiario_tipo:str="aluno", beneficiario_nome:str="", loan_id:int=0) -> int:
     agora = datetime.now()
-    inserir_movimento({
+    return inserir_movimento({
         "timestamp": agora.isoformat(timespec='seconds'),
         "data": agora.strftime('%d/%m/%Y'),
         "hora": agora.strftime('%H:%M:%S'),
@@ -331,6 +492,7 @@ def _base_registro(tipo:str, item_nome:str, categoria:str, quantidade:int, prev_
         "quantidade": int(quantidade) if quantidade else 1,
         "beneficiario_tipo": beneficiario_tipo,
         "beneficiario_nome": beneficiario_nome,
+        "loan_id": int(loan_id or 0),
     })
 
 # ------ Aba: Empréstimo Aluno ------
@@ -376,7 +538,6 @@ with abas[0]:
                     con.execute("INSERT OR IGNORE INTO alunos (nome,sobrenome,serie) VALUES (?,?,?)", (nome.strip(), sobrenome.strip(), serie.strip()))
                     con.commit()
                 df_alunos.clear()
-            # categoria do item selecionado
             cat_sel = dfi.loc[dfi["item_nome"]==escolha, "categoria"].values
             categoria_item = (cat_sel[0] if len(cat_sel) else "Livro")
             _base_registro(
@@ -438,35 +599,52 @@ with abas[1]:
                 )
             st.success(f"Empréstimos registrados para {prof}.")
 
-# ------ Aba: Devolução (parcial) ------
+# ------ Aba: Devolução (por empréstimo) ------
 with abas[2]:
-    st.subheader("Devolução (parcial ou total)")
-    if dfi.empty:
-        st.info("Catálogo vazio.")
+    st.subheader("Devolução por empréstimo (parcial ou total)")
+
+    pend = emprestimos_pendentes_df()
+    if pend.empty:
+        st.info("Não há empréstimos pendentes no momento.")
     else:
-        sal_emprest = saldos[saldos["emprestado"]>0].copy()
-        if sal_emprest.empty:
-            st.info("Não há itens emprestados no momento.")
-        else:
-            labels = {r.item_nome: f"{r.item_nome} – {int(r.emprestado)} emprestado(s)" for r in sal_emprest.itertuples(index=False)}
-            chosen = st.selectbox("Selecione o item", options=list(labels.keys()), format_func=lambda k: labels.get(k,k), key="sel_dev_item")
-            emprestado_q = int(sal_emprest.loc[sal_emprest['item_nome']==chosen,'emprestado'].values[0])
-            qtd_dev = st.number_input("Quantidade a devolver", min_value=1, max_value=emprestado_q, value=emprestado_q, key="qtd_dev")
-            observ_d = st.text_input("Observações", key="obs_dev")
-            if st.button("↩️ Registrar Devolução", use_container_width=True, key="btn_dev"):
-                _base_registro(
-                    tipo="Devolucao",
-                    item_nome=chosen,
-                    categoria="",
-                    quantidade=int(qtd_dev),
-                    prev_dev=None,
-                    observ=observ_d,
-                    beneficiario_tipo="", beneficiario_nome="",
-                )
-                st.success("Devolução registrada.")
+        # label amigável
+        def _label(row):
+            who = (row["beneficiario_nome"] if row["beneficiario_tipo"]=="professor"
+                   else f"{row['aluno_nome']} {row['aluno_sobrenome']} — {row['aluno_serie']}".strip())
+            prev = row["prev_devolucao"] or "s/prev."
+            cat = row["categoria"] or "Livro"
+            tit = row["titulo"] or row["item_nome"]
+            atras = "⚠️ ATRASADO " if row["atrasado"] else ""
+            return f"{atras}[{cat}] {tit} • {who} • pendente: {int(row['q_pendente'])} • prev: {prev}"
+
+        options = {int(r.loan_id): _label(r) for _, r in pend.iterrows()}
+        sel_loan = st.selectbox("Escolha o empréstimo", options=list(options.keys()), format_func=lambda k: options.get(k,str(k)), key="sel_dev_loan")
+        row_sel = pend[pend["loan_id"]==int(sel_loan)].iloc[0]
+        max_dev = int(row_sel["q_pendente"])
+        qtd_dev = st.number_input("Quantidade a devolver", min_value=1, max_value=max_dev, value=max_dev, key="qtd_dev")
+        observ_d = st.text_input("Observações", key="obs_dev")
+
+        if st.button("↩️ Registrar Devolução", use_container_width=True, key="btn_dev"):
+            # Registrar devolução vinculada ao loan_id selecionado
+            _base_registro(
+                tipo="Devolucao",
+                item_nome=row_sel["item_nome"],
+                categoria=row_sel["categoria"],
+                quantidade=int(qtd_dev),
+                prev_dev=None,
+                observ=observ_d,
+                aluno_nome=row_sel.get("aluno_nome","") or "",
+                aluno_sobrenome=row_sel.get("aluno_sobrenome","") or "",
+                aluno_serie=row_sel.get("aluno_serie","") or "",
+                beneficiario_tipo=row_sel.get("beneficiario_tipo","") or "",
+                beneficiario_nome=row_sel.get("beneficiario_nome","") or "",
+                loan_id=int(sel_loan),
+            )
+            st.success("Devolução registrada.")
+            st.rerun()
 
     st.markdown("---")
-    st.caption("Saldos atuais")
+    st.caption("Saldos atuais por item")
     st.dataframe(status_itens(df_mov()), use_container_width=True, hide_index=True)
 
 # ------ Aba: Catálogo ------
@@ -562,7 +740,7 @@ with abas[3]:
 
     # Auxiliares locais
     def df_itens_full():
-        init_db()
+        ensure_migrations()
         with get_conn() as con:
             return pd.read_sql_query(
                 "SELECT id,item_nome,categoria,titulo,autor,editora,genero,isbn,edicao,quant_total FROM itens",
@@ -572,7 +750,7 @@ with abas[3]:
     def update_item(item_id:int, **fields):
         if not fields:
             return
-        init_db()
+        ensure_migrations()
         cols = [k for k in ["item_nome","categoria","titulo","autor","editora","genero","isbn","edicao","quant_total"] if k in fields]
         if not cols:
             return
@@ -584,7 +762,7 @@ with abas[3]:
         df_itens.clear()
 
     def delete_item(item_id:int):
-        init_db()
+        ensure_migrations()
         with get_conn() as con:
             con.execute("DELETE FROM itens WHERE id=?", (item_id,))
             con.commit()
@@ -629,7 +807,6 @@ with abas[3]:
             excluir = colbtn2.form_submit_button("🗑️ Excluir item", disabled=(emp_q>0))
 
         if salvar:
-            # Para Jogo, permitir título vazio e usar item_nome como nome principal
             item_nome_new = (titulo_e.strip() or isbn_e.strip() or autor_e.strip())
             if categoria_e == "Jogo" and not item_nome_new:
                 item_nome_new = item_row["item_nome"]  # fallback
@@ -646,13 +823,13 @@ with abas[3]:
             else:
                 delete_item(int(sel_id))
                 st.success("Item excluído do catálogo.")
-                st.experimental_rerun()
+                st.rerun()
 
     st.markdown("---")
     st.caption("Catálogo atual")
     st.dataframe(df_itens(), use_container_width=True, hide_index=True)
 
-    # Exportar catálogo (inclui livros e jogos — você não precisa exportar jogos separadamente)
+    # Exportar catálogo
     buf = BytesIO()
     try:
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
@@ -757,3 +934,30 @@ with abas[4]:
             nome = f"movimentacoes_{data_ini:%Y%m%d}_{data_fim:%Y%m%d}.xlsx"
             st.download_button("⬇️ Baixar movimentações", data=buffer.getvalue(), file_name=nome,
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_mov")
+
+        st.markdown("### 📥 Exportar Empréstimos Pendentes")
+        pend = emprestimos_pendentes_df()
+        if pend.empty:
+            st.caption("Não há pendências no momento.")
+        else:
+            # planilha de pendentes
+            bufp = BytesIO()
+            with pd.ExcelWriter(bufp, engine="xlsxwriter") as w:
+                export_cols = [
+                    ("LoanID","loan_id"),
+                    ("Data","data"),("Hora","hora"),
+                    ("Categoria","categoria"),("Título/Item","titulo"),
+                    ("Item (chave)","item_nome"),
+                    ("Qtd Emp.","q_emprestado"),("Qtd Dev.","q_devolvido"),("Qtd Pendente","q_pendente"),
+                    ("Prev. Devolução","prev_devolucao"),
+                    ("Tipo Beneficiário","beneficiario_tipo"),
+                    ("Nome Beneficiário","beneficiario_nome"),
+                    ("Aluno Nome","aluno_nome"),("Aluno Sobrenome","aluno_sobrenome"),("Série","aluno_serie"),
+                    ("Atrasado","atrasado"),
+                ]
+                dfexp = pend[[c for _,c in export_cols]].rename(columns=dict(export_cols))
+                dfexp.to_excel(w, sheet_name="pendentes", index=False)
+            bufp.seek(0)
+            st.download_button("⬇️ Baixar pendentes (.xlsx)", data=bufp.getvalue(),
+                               file_name="emprestimos_pendentes.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_pendentes")
